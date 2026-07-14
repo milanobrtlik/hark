@@ -1,0 +1,6 @@
+/target
+
+# Local tooling configuration, not part of the app.
+/.claude/
+/.zenide/
+/.mcp.json

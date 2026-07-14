@@ -1,6 +1,7 @@
 mod audio;
 mod decode;
 mod library;
+mod mpris;
 mod opus_source;
 mod player_view;
 mod queue;
@@ -11,10 +12,11 @@ mod waveform;
 
 use anyhow::Context as _;
 use gpui::{
-    App, Application, AssetSource, Bounds, Result, SharedString, WindowBackgroundAppearance,
-    WindowBounds, WindowDecorations, WindowOptions, prelude::*, px, size,
+    App, Application, AssetSource, Bounds, KeyBinding, Result, SharedString,
+    WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions, prelude::*, px,
+    size,
 };
-use player_view::PlayerView;
+use player_view::{PlayerView, TogglePlay};
 use rust_embed::RustEmbed;
 
 #[derive(RustEmbed)]
@@ -41,6 +43,12 @@ fn main() {
     let paths: Vec<std::path::PathBuf> = std::env::args_os().skip(1).map(Into::into).collect();
 
     Application::new().with_assets(Assets).run(move |cx: &mut App| {
+        cx.bind_keys([KeyBinding::new(
+            "space",
+            TogglePlay,
+            Some(player_view::KEY_CONTEXT),
+        )]);
+
         let bounds = Bounds::centered(None, size(px(420.), px(690.)), cx);
 
         cx.open_window(

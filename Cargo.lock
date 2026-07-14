@@ -2488,6 +2488,7 @@ dependencies = [
  "opus",
  "rodio",
  "rust-embed",
+ "zbus",
 ]
 
 [[package]]

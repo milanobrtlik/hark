@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Hark
+GenericName=Music Player
+Comment=Minimalist music player
+Exec=@BIN@ %F
+Icon=dev.milan.hark
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+Keywords=music;audio;player;
+StartupNotify=true
+# X11 only; on Wayland GNOME matches the window's app id to this file's name.
+StartupWMClass=dev.milan.hark
+MimeType=audio/mpeg;audio/flac;audio/x-flac;audio/ogg;audio/x-vorbis+ogg;audio/opus;audio/x-opus+ogg;audio/wav;audio/x-wav;audio/mp4;audio/x-m4a;audio/aac;

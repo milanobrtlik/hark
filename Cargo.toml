@@ -1,0 +1,20 @@
+[package]
+name = "hark"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gpui = "0.2.2"
+rodio = "0.22"
+# Symphonia (rodio's decoder) has no Opus support, so Opus is decoded here:
+# `ogg` demuxes the container, `opus` binds libopus for the codec itself.
+ogg = "0.9"
+opus = "0.3"
+lofty = "0.24"
+notify = "8"
+rust-embed = "8"
+anyhow = "1"
+
+# Audio decoding is unusably slow when dependencies are built without optimizations.
+[profile.dev.package."*"]
+opt-level = 2

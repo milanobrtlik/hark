@@ -12,6 +12,8 @@ ogg = "0.9"
 opus = "0.3"
 lofty = "0.24"
 notify = "8"
+# The desktop's media keys and system media controls speak MPRIS over D-Bus.
+zbus = "5"
 rust-embed = "8"
 anyhow = "1"
 

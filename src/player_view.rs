@@ -1,5 +1,6 @@
 use crate::audio::Audio;
 use crate::library;
+use crate::mpris::{self, Mpris};
 use crate::queue::{Queue, Repeat};
 use crate::theme;
 use crate::track::{Track, format_time};
@@ -9,10 +10,10 @@ use crate::waveform;
 use notify::{RecursiveMode, Watcher};
 
 use gpui::{
-    Bounds, Context, CursorStyle, Decorations, DragMoveEvent, Empty, ExternalPaths, HitboxBehavior,
-    IntoElement, MouseButton, MouseDownEvent, ObjectFit, PathPromptOptions, Pixels, Point, Render,
-    ResizeEdge, SharedString, Size, Task, Window, canvas, div, fill, img, point, prelude::*, px,
-    size, svg,
+    App, Bounds, Context, CursorStyle, Decorations, DragMoveEvent, Empty, ExternalPaths,
+    FocusHandle, Focusable, HitboxBehavior, IntoElement, MouseButton, MouseDownEvent, ObjectFit,
+    PathPromptOptions, Pixels, Point, Render, ResizeEdge, SharedString, Size, Task, Window, actions,
+    canvas, div, fill, img, point, prelude::*, px, size, svg,
 };
 use std::cell::Cell;
 use std::collections::HashSet;
@@ -22,6 +23,11 @@ use std::time::Duration;
 
 const SHADOW_SIZE: Pixels = px(10.);
 const CORNER: Pixels = px(14.);
+
+actions!(hark, [TogglePlay]);
+
+/// Key context of the player window; the keymap binds `space` against it.
+pub const KEY_CONTEXT: &str = "Player";
 
 /// Drag markers. GPUI routes drag-move events by the payload type, so the seek
 /// bar and the volume slider need distinct ones.
@@ -34,6 +40,10 @@ pub struct PlayerView {
     audio: Option<Audio>,
     error: Option<SharedString>,
     queue: Queue,
+    /// Keeps the window focused on the player so key bindings reach it.
+    focus_handle: FocusHandle,
+    /// The desktop's media controls, including the keyboard's media keys.
+    mpris: Mpris,
     /// Normalized peaks of the current track; empty while still decoding.
     peaks: Vec<f32>,
     /// Position being previewed while the seek bar is dragged, 0..=1. The seek
@@ -59,10 +69,15 @@ impl PlayerView {
             Err(err) => (None, Some(SharedString::from(err.to_string()))),
         };
 
+        let focus_handle = cx.focus_handle();
+        window.focus(&focus_handle);
+
         let mut view = PlayerView {
             audio,
             error,
             queue: Queue::default(),
+            focus_handle,
+            mpris: Mpris::new(),
             peaks: Vec::new(),
             scrub: None,
             show_playlist: false,
@@ -176,6 +191,8 @@ impl PlayerView {
 
                 let alive = this
                     .update(cx, |this, cx| {
+                        this.sync_mpris(cx);
+
                         let finished = this.audio.as_ref().is_some_and(|a| a.finished());
                         if finished {
                             this.advance(false, cx);
@@ -360,6 +377,49 @@ impl PlayerView {
             audio.toggle_play();
         }
         cx.notify();
+    }
+
+    // -- desktop media controls --------------------------------------------
+
+    /// Carries out what the desktop asked for and mirrors the player back onto
+    /// the bus. Runs on every tick.
+    fn sync_mpris(&mut self, cx: &mut Context<Self>) {
+        for command in self.mpris.commands() {
+            match command {
+                mpris::Command::TogglePlay => self.toggle_play(cx),
+                mpris::Command::Play if !self.is_playing() => self.toggle_play(cx),
+                mpris::Command::Pause if self.is_playing() => self.toggle_play(cx),
+                mpris::Command::Play | mpris::Command::Pause => {}
+                mpris::Command::Next => self.advance(true, cx),
+                mpris::Command::Previous => self.previous(cx),
+                mpris::Command::SetVolume(volume) => {
+                    if let Some(audio) = self.audio.as_mut() {
+                        audio.set_volume(volume);
+                    }
+                    cx.notify();
+                }
+            }
+        }
+
+        self.mpris.publish(self.mpris_state(), self.position());
+    }
+
+    fn mpris_state(&self) -> mpris::State {
+        mpris::State {
+            playing: self.is_playing(),
+            volume: self.audio.as_ref().map(|a| a.volume()).unwrap_or(0.0),
+            track: self
+                .queue
+                .current
+                .zip(self.queue.current_track())
+                .map(|(index, track)| mpris::TrackInfo {
+                    index,
+                    title: track.title.to_string(),
+                    artist: track.artist.to_string(),
+                    album: track.album.to_string(),
+                    duration: track.duration,
+                }),
+        }
     }
 
     // -- scrubbing ---------------------------------------------------------
@@ -949,6 +1009,12 @@ impl PlayerView {
     }
 }
 
+impl Focusable for PlayerView {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
 impl Render for PlayerView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let decorations = window.window_decorations();
@@ -958,6 +1024,9 @@ impl Render for PlayerView {
             .id("window-backdrop")
             .size_full()
             .bg(gpui::transparent_black())
+            .key_context(KEY_CONTEXT)
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &TogglePlay, _, cx| this.toggle_play(cx)))
             // A drag can end anywhere in the window, so the seek is committed
             // here rather than on the seek bar itself.
             .on_mouse_up(

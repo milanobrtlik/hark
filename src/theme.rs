@@ -1,13 +1,26 @@
 use gpui::{Hsla, Rgba, rgb, rgba};
 
-/// Translucent window fill. The compositor blurs whatever is behind it — enough
-/// alpha to read as glass, not enough to see the desktop through the player.
-pub const GLASS: Rgba = Rgba {
-    r: 0.925,
-    g: 0.925,
-    b: 0.925,
-    a: 0.95,
-};
+/// The two tones of the translucent window fill, used as a subtle diagonal
+/// gradient (light corner to dark corner). The compositor blurs whatever is
+/// behind it — enough alpha to read as glass, not enough to see the desktop
+/// through the player.
+pub fn glass_light() -> Hsla {
+    Hsla {
+        h: 0.,
+        s: 0.,
+        l: 0.98,
+        a: 0.95,
+    }
+}
+
+pub fn glass_dark() -> Hsla {
+    Hsla {
+        h: 0.,
+        s: 0.,
+        l: 0.83,
+        a: 0.95,
+    }
+}
 
 /// Fill of the playlist panel. Nearly opaque: it covers the player behind it.
 pub fn panel() -> Rgba {
@@ -69,6 +82,6 @@ pub fn shadow() -> Hsla {
         h: 0.,
         s: 0.,
         l: 0.,
-        a: 0.35,
+        a: 0.22,
     }
 }

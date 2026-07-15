@@ -24,6 +24,10 @@ use std::time::Duration;
 const SHADOW_SIZE: Pixels = px(10.);
 const CORNER: Pixels = px(14.);
 
+/// Horizontal inset shared by the waveform, volume and footer rows so they line
+/// up at one width, a little narrower than the full content column.
+const RAIL_INSET: Pixels = px(16.);
+
 actions!(hark, [TogglePlay]);
 
 /// Key context of the player window; the keymap binds `space` against it.
@@ -465,18 +469,11 @@ impl PlayerView {
             .w_full()
             .px_2()
             .items_center()
-            .justify_between()
-            // The empty space between the buttons drags the window.
+            .justify_end()
+            // The empty space left of the buttons drags the window.
             .when(decorated, |this| {
                 this.on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
             })
-            .child(icon_button(
-                "close",
-                "icons/close.svg",
-                px(26.),
-                px(11.),
-                |_, window, _| window.remove_window(),
-            ))
             .child(
                 div()
                     .flex()
@@ -494,6 +491,13 @@ impl PlayerView {
                         px(26.),
                         px(11.),
                         |_, window, _| window.zoom_window(),
+                    ))
+                    .child(icon_button(
+                        "close",
+                        "icons/close.svg",
+                        px(26.),
+                        px(11.),
+                        |_, window, _| window.remove_window(),
                     )),
             )
     }
@@ -512,14 +516,17 @@ impl PlayerView {
                 .bg(theme::control())
                 .shadow(vec![gpui::BoxShadow {
                     color: theme::shadow(),
-                    offset: point(px(0.), px(6.)),
-                    blur_radius: px(16.),
+                    offset: point(px(0.), px(3.)),
+                    blur_radius: px(6.),
                     spread_radius: px(0.),
                 }]),
             CORNER,
         )
         .map(|this| match art {
-            Some(art) => this.child(img(art).size_full().object_fit(ObjectFit::Cover)),
+            Some(art) => this.child(rounded(
+                img(art).size_full().object_fit(ObjectFit::Cover),
+                CORNER,
+            )),
             None => this.child(
                 svg()
                     .path("icons/note.svg")
@@ -693,10 +700,11 @@ impl PlayerView {
             .items_center()
             .gap_3()
             .w_full()
+            .px(RAIL_INSET)
             .child(
                 svg()
                     .path("icons/volume_low.svg")
-                    .size(px(16.))
+                    .size(px(20.))
                     .flex_none()
                     .text_color(theme::text_dim()),
             )
@@ -707,12 +715,12 @@ impl PlayerView {
                     .flex()
                     .flex_1()
                     .items_center()
-                    .h(px(18.))
+                    .h(px(22.))
                     .cursor_pointer()
                     .child(measure)
                     .child(bar(
                         volume,
-                        px(6.),
+                        px(8.),
                         theme::slider_fill(),
                         theme::slider_track(),
                     ))
@@ -732,7 +740,7 @@ impl PlayerView {
             .child(
                 svg()
                     .path("icons/volume_high.svg")
-                    .size(px(16.))
+                    .size(px(20.))
                     .flex_none()
                     .text_color(theme::text_dim()),
             )
@@ -749,6 +757,7 @@ impl PlayerView {
             .items_center()
             .justify_between()
             .w_full()
+            .px(RAIL_INSET)
             .child(
                 div()
                     .flex()
@@ -996,6 +1005,7 @@ impl PlayerView {
                             .flex()
                             .flex_col()
                             .w_full()
+                            .px(RAIL_INSET)
                             .gap_1()
                             .child(self.waveform(cx))
                             .child(self.times()),
@@ -1100,7 +1110,11 @@ impl Render for PlayerView {
                         .size_full()
                         .flex()
                         .flex_col()
-                        .bg(theme::GLASS)
+                        .bg(gpui::linear_gradient(
+                            135.,
+                            gpui::linear_color_stop(theme::glass_dark(), 0.),
+                            gpui::linear_color_stop(theme::glass_light(), 1.),
+                        ))
                         .text_color(theme::text())
                         .cursor(CursorStyle::Arrow)
                         .when(matches!(decorations, Decorations::Client { .. }), |this| {

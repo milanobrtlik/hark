@@ -1,6 +1,7 @@
 mod artwork;
 mod audio;
 mod decode;
+mod fingerprint;
 mod library;
 mod mpris;
 mod opus_source;

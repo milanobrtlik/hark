@@ -21,6 +21,12 @@ anyhow = "1"
 # rustls-tls uses the ring provider already in the tree — no aws-lc/cmake, no OpenSSL.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde_json = "1"
+# Acoustic-fingerprint fallback: identify badly-tagged files via AcoustID when
+# the tag→iTunes cover path can't. rusty-chromaprint is pure Rust (rubato +
+# rustfft), so no libchromaprint/C dependency. base64 encodes the fingerprint
+# URL-safe without padding, as AcoustID expects.
+rusty-chromaprint = "0.3"
+base64 = "0.22"
 
 # Audio decoding is unusably slow when dependencies are built without optimizations.
 [profile.dev.package."*"]

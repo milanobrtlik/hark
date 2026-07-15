@@ -1,5 +1,8 @@
 /target
 
+# The AcoustID API key is baked in from here at build time; keep it local.
+/.env
+
 # Local tooling configuration, not part of the app.
 /.claude/
 /.zenide/

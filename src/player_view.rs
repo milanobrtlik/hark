@@ -1,5 +1,6 @@
 use crate::artwork;
 use crate::audio::Audio;
+use crate::fingerprint::{self, Identification};
 use crate::library;
 use crate::mpris::{self, Mpris};
 use crate::queue::{Queue, Repeat};
@@ -22,6 +23,7 @@ use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 const SHADOW_SIZE: Pixels = px(10.);
@@ -47,6 +49,51 @@ pub const KEY_CONTEXT: &str = "Player";
 struct SeekDrag;
 #[derive(Clone)]
 struct VolumeDrag;
+
+/// What the two-stage cover/identify task found, applied back on the main thread.
+enum Outcome {
+    /// An iTunes cover for an album: fill every track sharing the key.
+    AlbumCover { key: String, image: Arc<gpui::Image> },
+    /// A fingerprint identity for one file: fill that file (cover + metadata).
+    Identified {
+        path: PathBuf,
+        id: Identification,
+        image: Option<Arc<gpui::Image>>,
+    },
+    /// A transient iTunes failure — free the album key so it retries.
+    RetryAlbum { key: String },
+    /// A transient fingerprint failure — free the path so it retries.
+    RetryPath { path: PathBuf },
+    Nothing,
+}
+
+/// Overwrites a track's metadata with what AcoustID recovered, leaving any field
+/// the lookup didn't fill untouched. Titles land on the chapters of a full-album
+/// file, or on the track itself when it has none.
+fn apply_identity(track: &mut Track, id: &Identification) {
+    if let Some(artist) = id.artist.as_deref().filter(|s| !s.is_empty()) {
+        track.artist = artist.to_string().into();
+    }
+    if let Some(album) = id.album.as_deref().filter(|s| !s.is_empty()) {
+        track.album = album.to_string().into();
+    }
+    if track.chapters.is_empty() {
+        if let Some(title) = id
+            .chapter_titles
+            .first()
+            .and_then(|t| t.as_deref())
+            .filter(|s| !s.is_empty())
+        {
+            track.title = title.to_string().into();
+        }
+    } else {
+        for (chapter, title) in track.chapters.iter_mut().zip(&id.chapter_titles) {
+            if let Some(title) = title.as_deref().filter(|s| !s.is_empty()) {
+                chapter.title = title.to_string().into();
+            }
+        }
+    }
+}
 
 pub struct PlayerView {
     audio: Option<Audio>,
@@ -74,6 +121,9 @@ pub struct PlayerView {
     /// Normalized (artist, album) keys already fetched or attempted this session,
     /// so moving between tracks of one album doesn't refetch.
     cover_keys: HashSet<String>,
+    /// Paths already run through the fingerprint fallback this session, so a
+    /// badly-tagged file isn't re-identified every time it plays.
+    fp_paths: HashSet<PathBuf>,
     /// Runs a play/pause volume ramp; replacing it supersedes a fade still going.
     _fade_task: Option<Task<()>>,
     _tick: Task<()>,
@@ -117,6 +167,7 @@ impl PlayerView {
             _waveform_task: None,
             _cover_task: None,
             cover_keys: HashSet::new(),
+            fp_paths: HashSet::new(),
             _fade_task: None,
             _tick: Self::spawn_tick(cx),
             _watcher: None,
@@ -439,53 +490,111 @@ impl PlayerView {
         }));
     }
 
-    /// Fetches a cover from the internet for the current track when it has none,
-    /// then fills every queued track that shares the album. Skips files whose
-    /// artist or album is only the placeholder, and each album is tried once.
+    /// Finds a cover — and, as a last resort, correct metadata — for the current
+    /// track when it has none. Two stages run in one background task:
+    ///
+    /// 1. **Tags → iTunes** when the artist and album are real: on a hit every
+    ///    queued track sharing the album is filled; each album is tried once.
+    /// 2. **Fingerprint → AcoustID** when the tags are unusable, or when iTunes
+    ///    has no such album: the file is identified by its sound, which yields a
+    ///    Cover Art Archive cover plus the correct artist, album and per-chapter
+    ///    titles. This is heavier, so it is gated behind a configured API key and
+    ///    deduplicated per file.
     fn ensure_cover(&mut self, cx: &mut Context<Self>) {
         let Some(track) = self.queue.current_track() else {
             return;
         };
-        if track.art.is_some()
-            || track.artist == crate::track::UNKNOWN_ARTIST
-            || track.album == crate::track::UNKNOWN_ALBUM
-        {
+        if track.art.is_some() {
             return;
         }
 
-        let key = artwork::key(&track.artist, &track.album);
-        // A false insert means this album is already cached or in flight.
-        if !self.cover_keys.insert(key.clone()) {
+        let tag_known = track.artist != crate::track::UNKNOWN_ARTIST
+            && track.album != crate::track::UNKNOWN_ALBUM;
+        let fp_enabled = fingerprint::API_KEY.is_some();
+
+        // Stage 1 is deduped by album key; the fingerprint fallback for a
+        // tag-less file is deduped by path. A track is only ever one or the other.
+        let album_key = tag_known.then(|| artwork::key(&track.artist, &track.album));
+        let run_itunes = match &album_key {
+            Some(key) => self.cover_keys.insert(key.clone()),
+            None => false,
+        };
+        let run_fingerprint_directly =
+            !tag_known && fp_enabled && self.fp_paths.insert(track.path.clone());
+        if !run_itunes && !run_fingerprint_directly {
             return;
         }
 
+        let path = track.path.clone();
         let artist = track.artist.to_string();
         let album = track.album.to_string();
+        let track = track.clone();
+
         // Replacing the task cancels a fetch still running for the old track.
         self._cover_task = Some(cx.spawn(async move |this, cx| {
-            let (image, transient) = cx
+            let outcome = cx
                 .background_executor()
-                .spawn(async move { artwork::load_or_fetch(&artist, &album) })
+                .spawn(async move {
+                    // Stage 1: tags → iTunes.
+                    if run_itunes {
+                        let key = album_key.expect("run_itunes implies an album key");
+                        let (image, transient) = artwork::load_or_fetch(&artist, &album);
+                        if let Some(image) = image {
+                            return Outcome::AlbumCover { key, image };
+                        }
+                        if transient {
+                            return Outcome::RetryAlbum { key };
+                        }
+                        // A definitive miss falls through to the fingerprint path.
+                    }
+
+                    // Stage 2: fingerprint → AcoustID.
+                    let Some(api_key) = fingerprint::API_KEY else {
+                        return Outcome::Nothing;
+                    };
+                    let Some(id) = fingerprint::identify(&track, api_key) else {
+                        return Outcome::RetryPath { path };
+                    };
+                    let (image, _transient) = artwork::load_or_fetch_release_group(&id.mbid);
+                    Outcome::Identified { path, id, image }
+                })
                 .await;
 
-            this.update(cx, |this, cx| match image {
-                Some(image) => {
+            this.update(cx, |this, cx| match outcome {
+                Outcome::AlbumCover { key, image } => {
                     // Indices may have shifted since the fetch began, so match by
                     // key; this also fills sibling and per-chapter tracks at once.
                     for track in &mut this.queue.tracks {
-                        if track.art.is_none()
-                            && artwork::key(&track.artist, &track.album) == key
-                        {
+                        if track.art.is_none() && artwork::key(&track.artist, &track.album) == key {
                             track.art = Some(image.clone());
                         }
                     }
                     cx.notify();
                 }
-                // A transient failure (offline, rate limit) should retry later.
-                None if transient => {
+                Outcome::Identified { path, id, image } => {
+                    // Fill only the file that was fingerprinted — two unrelated
+                    // badly-tagged files must not share one identity.
+                    for track in &mut this.queue.tracks {
+                        if track.path != path {
+                            continue;
+                        }
+                        if let Some(image) = &image
+                            && track.art.is_none()
+                        {
+                            track.art = Some(image.clone());
+                        }
+                        apply_identity(track, &id);
+                    }
+                    cx.notify();
+                }
+                // Transient failures should retry on a later play.
+                Outcome::RetryAlbum { key } => {
                     this.cover_keys.remove(&key);
                 }
-                None => {}
+                Outcome::RetryPath { path } => {
+                    this.fp_paths.remove(&path);
+                }
+                Outcome::Nothing => {}
             })
             .ok();
         }));

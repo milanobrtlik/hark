@@ -13,7 +13,15 @@ pub struct Audio {
     player: Player,
     /// Sample rate the output device is currently open at.
     rate: SampleRate,
+    /// The user's chosen volume, 0..=1 — what the slider and MPRIS report.
     volume: f32,
+    /// A cosmetic gain, 0..=1, ramped by the view to fade play/pause in and out.
+    /// The player runs at `volume * fade`, so a fade never disturbs `volume`.
+    fade: f32,
+    /// Intended audible state. Kept apart from the rodio player so the UI can
+    /// read "paused" the instant a fade-out begins, while the audio keeps
+    /// flowing until the ramp reaches silence.
+    playing: bool,
     /// A track has been loaded into the player at least once. Before that,
     /// `player.empty()` is trivially true and must not be read as "finished".
     loaded: bool,
@@ -55,27 +63,34 @@ impl Audio {
         let rate = device.config().sample_rate();
         let player = Player::connect_new(device.mixer());
         let volume = 0.7;
-        player.set_volume(volume);
+        let fade = 1.0;
+        player.set_volume(volume * fade);
 
         Ok(Audio {
             _device: device,
             player,
             rate,
             volume,
+            fade,
+            playing: false,
             loaded: false,
         })
     }
 
     pub fn play_file(&mut self, path: &Path) -> Result<()> {
         let source = decode::open(path)?;
+        let track_rate = source.sample_rate();
+
+        // A fresh track always plays at full player gain; any play/pause fade
+        // left over belongs to the previous track.
+        self.fade = 1.0;
 
         // Reopen the device at the track's own rate when it differs, so the
         // samples reach the sink untouched.
-        let track_rate = source.sample_rate();
         if track_rate != self.rate {
             let device = open_device(Some(track_rate))?;
             let player = Player::connect_new(device.mixer());
-            player.set_volume(self.volume);
+            player.set_volume(self.effective());
             self.rate = device.config().sample_rate();
             self._device = device;
             self.player = player;
@@ -83,26 +98,38 @@ impl Audio {
 
         self.player.clear();
         self.player.append(source);
+        self.player.set_volume(self.effective());
         self.player.play();
         self.loaded = true;
+        self.playing = true;
         Ok(())
     }
 
-    pub fn toggle_play(&mut self) {
-        if self.player.is_paused() {
-            self.player.play();
-        } else {
-            self.player.pause();
-        }
+    /// Starts the audio flowing. The view eases it in with a fade.
+    pub fn resume(&mut self) {
+        self.playing = true;
+        self.player.play();
+    }
+
+    /// Marks the player paused for the UI while leaving the audio running, so a
+    /// fade-out can still be heard. [`Self::commit_pause`] stops it for real.
+    pub fn begin_pause(&mut self) {
+        self.playing = false;
+    }
+
+    /// Actually stops the audio, once the fade-out has reached silence.
+    pub fn commit_pause(&mut self) {
+        self.player.pause();
     }
 
     pub fn stop(&mut self) {
         self.player.clear();
+        self.playing = false;
         self.loaded = false;
     }
 
     pub fn is_playing(&self) -> bool {
-        self.loaded && !self.player.is_paused() && !self.player.empty()
+        self.loaded && self.playing && !self.player.empty()
     }
 
     /// True once the current source has played to its end.
@@ -135,6 +162,25 @@ impl Audio {
 
     pub fn set_volume(&mut self, volume: f32) {
         self.volume = volume.clamp(0.0, 1.0);
-        self.player.set_volume(self.volume);
+        self.apply();
+    }
+
+    pub fn fade(&self) -> f32 {
+        self.fade
+    }
+
+    pub fn set_fade(&mut self, fade: f32) {
+        self.fade = fade.clamp(0.0, 1.0);
+        self.apply();
+    }
+
+    /// The gain the player actually runs at: the user's volume scaled by the
+    /// play/pause fade.
+    fn effective(&self) -> f32 {
+        self.volume * self.fade
+    }
+
+    fn apply(&self) {
+        self.player.set_volume(self.effective());
     }
 }

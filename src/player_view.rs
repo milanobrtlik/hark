@@ -12,7 +12,8 @@ use notify::{RecursiveMode, Watcher};
 use gpui::{
     App, Bounds, Context, CursorStyle, Decorations, DragMoveEvent, Empty, ExternalPaths,
     FocusHandle, Focusable, HitboxBehavior, IntoElement, MouseButton, MouseDownEvent, ObjectFit,
-    PathPromptOptions, Pixels, Point, Render, ResizeEdge, SharedString, Size, Task, Window, actions,
+    PathPromptOptions, Pixels, Point, Render, ResizeEdge, ScrollDelta, ScrollWheelEvent,
+    SharedString, Size, Task, Window, actions,
     canvas, div, fill, img, point, prelude::*, px, size, svg,
 };
 use std::cell::Cell;
@@ -455,6 +456,19 @@ impl PlayerView {
             audio.set_volume(fraction);
         }
         cx.notify();
+    }
+
+    /// Nudges the volume by a wheel scroll — up for louder. `set_volume` clamps,
+    /// so it is safe to run past either end of the range.
+    fn nudge_volume(&mut self, delta: &ScrollDelta, cx: &mut Context<Self>) {
+        let step = scroll_volume_step(delta);
+        if step == 0.0 {
+            return;
+        }
+        if let Some(audio) = self.audio.as_mut() {
+            audio.set_volume(audio.volume() + step);
+            cx.notify();
+        }
     }
 
     // -- rendering ---------------------------------------------------------
@@ -999,6 +1013,12 @@ impl PlayerView {
                     .items_center()
                     .justify_center()
                     .gap_4()
+                    // Scrolling anywhere over the player changes the volume. When
+                    // the playlist is open it covers this column and takes the
+                    // scroll for its own list instead.
+                    .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                        this.nudge_volume(&event.delta, cx)
+                    }))
                     .child(self.cover())
                     .child(
                         div()
@@ -1170,6 +1190,19 @@ impl Render for PlayerView {
                 .overflow_hidden(),
             )
     }
+}
+
+/// Volume change for one scroll event. Positive scrolls up (louder). Measured in
+/// lines so a mouse wheel and a trackpad feel alike: a wheel notch is three lines
+/// — about a 6% step — and a trackpad's pixel deltas fold back at roughly 20px a
+/// line.
+fn scroll_volume_step(delta: &ScrollDelta) -> f32 {
+    const PER_LINE: f32 = 0.02;
+    let lines = match delta {
+        ScrollDelta::Lines(p) => p.y,
+        ScrollDelta::Pixels(p) => f32::from(p.y) / 20.0,
+    };
+    lines * PER_LINE
 }
 
 /// Which window edge the pointer is over, if any. Copied from GPUI's

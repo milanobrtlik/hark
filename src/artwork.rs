@@ -82,7 +82,7 @@ fn cached(key: &str) -> Cache {
     Cache::Absent
 }
 
-fn client() -> &'static reqwest::blocking::Client {
+pub(crate) fn client() -> &'static reqwest::blocking::Client {
     static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::blocking::Client::builder()
@@ -127,10 +127,20 @@ fn fetch(artist: &str, album: &str) -> Fetch {
     // The 100px thumbnail URL scales up to a size that suits the display; the
     // replace is a harmless no-op if Apple ever changes the path segment.
     let big = url.replace("100x100bb", "600x600bb");
-    let image = client().get(&big).send();
+    fetch_image(&big)
+}
+
+/// Downloads and validates image bytes from `url`. A 404 is a definitive miss
+/// (there is no such cover); any other failure — offline, 5xx, non-image body —
+/// is transient and worth a later retry.
+fn fetch_image(url: &str) -> Fetch {
+    let image = client().get(url).send();
     let Ok(image) = image else {
         return Fetch::Error;
     };
+    if image.status() == reqwest::StatusCode::NOT_FOUND {
+        return Fetch::Miss;
+    }
     if !image.status().is_success() {
         return Fetch::Error;
     }
@@ -186,6 +196,34 @@ pub fn load_or_fetch(artist: &str, album: &str) -> (Option<Arc<Image>>, bool) {
         }
         Fetch::Miss => {
             store_miss(&key);
+            (None, false)
+        }
+        Fetch::Error => (None, true),
+    }
+}
+
+/// Returns the Cover Art Archive front cover for a MusicBrainz release-group
+/// MBID, from cache or the internet, and whether a failure (if any) was
+/// transient. The MBID is a 36-char UUID, so it never collides with the 16-hex
+/// `(artist, album)` keys sharing this cache dir. Used by the fingerprint
+/// fallback once AcoustID has identified an album. Runs blocking — call it on
+/// the background executor.
+pub fn load_or_fetch_release_group(mbid: &str) -> (Option<Arc<Image>>, bool) {
+    match cached(mbid) {
+        Cache::Hit(image) => return (Some(image), false),
+        Cache::Negative => return (None, false),
+        Cache::Absent => {}
+    }
+
+    let url = format!("https://coverartarchive.org/release-group/{mbid}/front-500");
+    match fetch_image(&url) {
+        Fetch::Hit(bytes) => {
+            store(mbid, &bytes);
+            (decode(bytes), false)
+        }
+        // A release group with no front cover: remember it so we don't ask again.
+        Fetch::Miss => {
+            store_miss(mbid);
             (None, false)
         }
         Fetch::Error => (None, true),

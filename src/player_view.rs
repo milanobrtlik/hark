@@ -10,8 +10,9 @@ use crate::waveform;
 use notify::{RecursiveMode, Watcher};
 
 use gpui::{
-    App, Bounds, Context, CursorStyle, Decorations, DragMoveEvent, Empty, ExternalPaths,
-    FocusHandle, Focusable, HitboxBehavior, IntoElement, MouseButton, MouseDownEvent, ObjectFit,
+    AnyWindowHandle, App, Bounds, Context, CursorStyle, Decorations, DragMoveEvent, Empty,
+    ExternalPaths, FocusHandle, Focusable, HitboxBehavior, IntoElement, MouseButton, MouseDownEvent,
+    ObjectFit,
     PathPromptOptions, Pixels, Point, Render, ResizeEdge, ScrollDelta, ScrollWheelEvent,
     SharedString, Size, Task, Window, actions,
     canvas, div, fill, img, point, prelude::*, px, size, svg,
@@ -24,6 +25,11 @@ use std::time::Duration;
 
 const SHADOW_SIZE: Pixels = px(10.);
 const CORNER: Pixels = px(14.);
+
+/// How long a resume, pause or window-close takes to fade, and how often the
+/// gain is stepped while it does. ~15 steps keeps the ramp free of zipper noise.
+const FADE: Duration = Duration::from_millis(180);
+const FADE_STEP: Duration = Duration::from_millis(12);
 
 /// Horizontal inset shared by the waveform, volume and footer rows so they line
 /// up at one width, a little narrower than the full content column.
@@ -56,9 +62,14 @@ pub struct PlayerView {
     /// decoder stutter.
     scrub: Option<f32>,
     show_playlist: bool,
+    /// Set once a fade-out-before-close is under way, so the close is only
+    /// deferred once and the second attempt is let through.
+    closing: bool,
     seek_bounds: Rc<Cell<Bounds<Pixels>>>,
     volume_bounds: Rc<Cell<Bounds<Pixels>>>,
     _waveform_task: Option<Task<()>>,
+    /// Runs a play/pause volume ramp; replacing it supersedes a fade still going.
+    _fade_task: Option<Task<()>>,
     _tick: Task<()>,
     /// Watches the music folder. Dropping it stops the notifications.
     _watcher: Option<notify::RecommendedWatcher>,
@@ -77,6 +88,14 @@ impl PlayerView {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle);
 
+        // Fade the audio out before the window manager closes the window too.
+        let weak = cx.weak_entity();
+        window.on_window_should_close(cx, move |window, cx| {
+            let handle = window.window_handle();
+            weak.update(cx, |this, cx| this.begin_close(handle, cx))
+                .unwrap_or(true)
+        });
+
         let mut view = PlayerView {
             audio,
             error,
@@ -86,9 +105,11 @@ impl PlayerView {
             peaks: Vec::new(),
             scrub: None,
             show_playlist: false,
+            closing: false,
             seek_bounds: Rc::new(Cell::new(Bounds::default())),
             volume_bounds: Rc::new(Cell::new(Bounds::default())),
             _waveform_task: None,
+            _fade_task: None,
             _tick: Self::spawn_tick(cx),
             _watcher: None,
         };
@@ -312,6 +333,8 @@ impl PlayerView {
         let Some(track) = self.queue.tracks.get(index).cloned() else {
             return;
         };
+        // A new track supersedes any play/pause fade still ramping.
+        self._fade_task = None;
         let Some(audio) = self.audio.as_mut() else {
             return;
         };
@@ -348,6 +371,7 @@ impl PlayerView {
         match self.queue.next(manual) {
             Some(index) => self.play_index(index, cx),
             None => {
+                self._fade_task = None;
                 if let Some(audio) = self.audio.as_mut() {
                     audio.stop();
                 }
@@ -378,10 +402,107 @@ impl PlayerView {
             }
             return;
         }
-        if let Some(audio) = self.audio.as_mut() {
-            audio.toggle_play();
-        }
+        self.fade_to(!self.is_playing(), cx);
         cx.notify();
+    }
+
+    /// Resumes or pauses the current track, easing the volume in or out so the
+    /// change is never an abrupt cut. Play starts the audio straight away and
+    /// ramps up; pause ramps down first and only then stops the player.
+    fn fade_to(&mut self, audible: bool, cx: &mut Context<Self>) {
+        let Some(audio) = self.audio.as_mut() else {
+            return;
+        };
+
+        let from = audio.fade();
+        if audible {
+            audio.resume();
+        } else {
+            audio.begin_pause();
+        }
+
+        let target = if audible { 1.0 } else { 0.0 };
+        let steps = (FADE.as_millis() / FADE_STEP.as_millis()).max(1) as u32;
+
+        // Replacing the task cancels a fade still ramping for the opposite move.
+        self._fade_task = Some(cx.spawn(async move |this, cx| {
+            for step in 1..=steps {
+                cx.background_executor().timer(FADE_STEP).await;
+                let fade = from + (target - from) * (step as f32 / steps as f32);
+                if this
+                    .update(cx, |this, cx| {
+                        if let Some(audio) = this.audio.as_mut() {
+                            audio.set_fade(fade);
+                        }
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+
+            // Land exactly on the target and, for a pause, stop the player now
+            // that it has gone quiet.
+            this.update(cx, |this, cx| {
+                if let Some(audio) = this.audio.as_mut() {
+                    audio.set_fade(target);
+                    if !audible {
+                        audio.commit_pause();
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Routes the close button through the same fade-out-then-close as the window
+    /// manager's close.
+    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.begin_close(window.window_handle(), cx) {
+            window.remove_window();
+        }
+    }
+
+    /// Fades the audio out and then closes `handle`. Returns `true` if the window
+    /// may close at once — nothing is playing, or a close is already under way —
+    /// and `false` when the close is deferred until the fade completes.
+    fn begin_close(&mut self, handle: AnyWindowHandle, cx: &mut Context<Self>) -> bool {
+        if self.closing {
+            return true;
+        }
+        self.closing = true;
+
+        let from = self.audio.as_ref().map(|a| a.fade()).unwrap_or(0.0);
+        if !self.is_playing() || from <= 0.0 {
+            return true;
+        }
+        if let Some(audio) = self.audio.as_mut() {
+            audio.begin_pause();
+        }
+
+        let steps = (FADE.as_millis() / FADE_STEP.as_millis()).max(1) as u32;
+        self._fade_task = Some(cx.spawn(async move |this, cx| {
+            for step in 1..=steps {
+                cx.background_executor().timer(FADE_STEP).await;
+                let fade = from * (1.0 - step as f32 / steps as f32);
+                if this
+                    .update(cx, |this, cx| {
+                        if let Some(audio) = this.audio.as_mut() {
+                            audio.set_fade(fade);
+                        }
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            handle.update(cx, |_, window, _| window.remove_window()).ok();
+        }));
+
+        false
     }
 
     // -- desktop media controls --------------------------------------------
@@ -473,7 +594,7 @@ impl PlayerView {
 
     // -- rendering ---------------------------------------------------------
 
-    fn header(&self, window: &Window) -> impl IntoElement {
+    fn header(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let decorated = matches!(window.window_decorations(), Decorations::Client { .. });
 
         div()
@@ -511,7 +632,7 @@ impl PlayerView {
                         "icons/close.svg",
                         px(26.),
                         px(11.),
-                        |_, window, _| window.remove_window(),
+                        cx.listener(|this, _, window, cx| this.close(window, cx)),
                     )),
             )
     }
@@ -1149,7 +1270,7 @@ impl Render for PlayerView {
                         .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                             this.add_paths(paths.paths().to_vec(), true, cx);
                         }))
-                        .child(self.header(window))
+                        .child(self.header(window, cx))
                         .child(
                             // Keeps the player a narrow column when the window
                             // is maximised instead of stretching it across the

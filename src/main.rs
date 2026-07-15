@@ -1,3 +1,4 @@
+mod artwork;
 mod audio;
 mod decode;
 mod library;

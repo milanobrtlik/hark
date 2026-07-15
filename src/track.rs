@@ -1,4 +1,4 @@
-use gpui::{Image, ImageFormat, SharedString};
+use gpui::{Image, SharedString};
 use lofty::config::ParseOptions;
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::ogg::{OpusFile, VorbisComments, VorbisFile};
@@ -10,6 +10,11 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Placeholder metadata for a file with no artist or album tag. Also guards the
+/// cover fetch: these are not real names, so they must not key a lookup.
+pub const UNKNOWN_ARTIST: &str = "Unknown artist";
+pub const UNKNOWN_ALBUM: &str = "Unknown album";
 
 /// One chapter of a track — a full-album file marks each song this way. `end` is
 /// the next chapter's start, or the track's end for the last one.
@@ -53,8 +58,8 @@ impl Track {
 
         let mut track = Track {
             title: stem.into(),
-            artist: "Unknown artist".into(),
-            album: "Unknown album".into(),
+            artist: UNKNOWN_ARTIST.into(),
+            album: UNKNOWN_ALBUM.into(),
             duration: Duration::ZERO,
             art: None,
             chapters: Vec::new(),
@@ -81,19 +86,10 @@ impl Track {
             track.album = album.to_string().into();
         }
 
-        track.art = tag.pictures().iter().find_map(|picture| {
-            let format = match picture.mime_type()?.as_str() {
-                "image/jpeg" | "image/jpg" => ImageFormat::Jpeg,
-                "image/png" => ImageFormat::Png,
-                "image/webp" => ImageFormat::Webp,
-                "image/gif" => ImageFormat::Gif,
-                _ => return None,
-            };
-            Some(Arc::new(Image::from_bytes(
-                format,
-                picture.data().to_vec(),
-            )))
-        });
+        track.art = tag
+            .pictures()
+            .iter()
+            .find_map(|picture| crate::artwork::decode(picture.data().to_vec()));
 
         track
     }

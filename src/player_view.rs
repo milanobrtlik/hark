@@ -1,3 +1,4 @@
+use crate::artwork;
 use crate::audio::Audio;
 use crate::library;
 use crate::mpris::{self, Mpris};
@@ -68,6 +69,11 @@ pub struct PlayerView {
     seek_bounds: Rc<Cell<Bounds<Pixels>>>,
     volume_bounds: Rc<Cell<Bounds<Pixels>>>,
     _waveform_task: Option<Task<()>>,
+    /// Fetches a cover for a track that has none. Dropping it cancels the fetch.
+    _cover_task: Option<Task<()>>,
+    /// Normalized (artist, album) keys already fetched or attempted this session,
+    /// so moving between tracks of one album doesn't refetch.
+    cover_keys: HashSet<String>,
     /// Runs a play/pause volume ramp; replacing it supersedes a fade still going.
     _fade_task: Option<Task<()>>,
     _tick: Task<()>,
@@ -109,6 +115,8 @@ impl PlayerView {
             seek_bounds: Rc::new(Cell::new(Bounds::default())),
             volume_bounds: Rc::new(Cell::new(Bounds::default())),
             _waveform_task: None,
+            _cover_task: None,
+            cover_keys: HashSet::new(),
             _fade_task: None,
             _tick: Self::spawn_tick(cx),
             _watcher: None,
@@ -411,6 +419,7 @@ impl PlayerView {
         self.queue.current = Some(index);
         self.peaks.clear();
         self.load_waveform(track.path, cx);
+        self.ensure_cover(cx);
         cx.notify();
     }
 
@@ -425,6 +434,58 @@ impl PlayerView {
             this.update(cx, |this, cx| {
                 this.peaks = peaks;
                 cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Fetches a cover from the internet for the current track when it has none,
+    /// then fills every queued track that shares the album. Skips files whose
+    /// artist or album is only the placeholder, and each album is tried once.
+    fn ensure_cover(&mut self, cx: &mut Context<Self>) {
+        let Some(track) = self.queue.current_track() else {
+            return;
+        };
+        if track.art.is_some()
+            || track.artist == crate::track::UNKNOWN_ARTIST
+            || track.album == crate::track::UNKNOWN_ALBUM
+        {
+            return;
+        }
+
+        let key = artwork::key(&track.artist, &track.album);
+        // A false insert means this album is already cached or in flight.
+        if !self.cover_keys.insert(key.clone()) {
+            return;
+        }
+
+        let artist = track.artist.to_string();
+        let album = track.album.to_string();
+        // Replacing the task cancels a fetch still running for the old track.
+        self._cover_task = Some(cx.spawn(async move |this, cx| {
+            let (image, transient) = cx
+                .background_executor()
+                .spawn(async move { artwork::load_or_fetch(&artist, &album) })
+                .await;
+
+            this.update(cx, |this, cx| match image {
+                Some(image) => {
+                    // Indices may have shifted since the fetch began, so match by
+                    // key; this also fills sibling and per-chapter tracks at once.
+                    for track in &mut this.queue.tracks {
+                        if track.art.is_none()
+                            && artwork::key(&track.artist, &track.album) == key
+                        {
+                            track.art = Some(image.clone());
+                        }
+                    }
+                    cx.notify();
+                }
+                // A transient failure (offline, rate limit) should retry later.
+                None if transient => {
+                    this.cover_keys.remove(&key);
+                }
+                None => {}
             })
             .ok();
         }));

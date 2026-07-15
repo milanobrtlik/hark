@@ -3,7 +3,7 @@ use crate::library;
 use crate::mpris::{self, Mpris};
 use crate::queue::{Queue, Repeat};
 use crate::theme;
-use crate::track::{Track, format_time};
+use crate::track::{Chapter, Track, format_time};
 use crate::ui::{bar, fraction_at, icon_button, rounded, toggle_button};
 use crate::waveform;
 
@@ -239,11 +239,50 @@ impl PlayerView {
         self.audio.as_ref().is_some_and(|a| a.is_playing())
     }
 
-    /// Position shown in the UI: the drag preview while scrubbing, otherwise the
-    /// player's real clock.
+    // -- chapters ----------------------------------------------------------
+    //
+    // A full-album file marks each song as a chapter. The player then treats the
+    // current chapter as if it were the track: the seek bar, times and title all
+    // scope to it, and prev/next step between chapters. A file without chapters
+    // behaves exactly as before — the "span" is simply the whole file.
+
+    /// The current track's chapters, empty when it has none.
+    fn chapters(&self) -> &[Chapter] {
+        self.queue
+            .current_track()
+            .map(|t| t.chapters.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Which chapter the playback clock is inside, by the real position — never
+    /// the scrub preview, since scrubbing moves within a chapter, not across.
+    fn current_chapter(&self) -> Option<usize> {
+        let chapters = self.chapters();
+        if chapters.is_empty() {
+            return None;
+        }
+        let pos = self.audio.as_ref().map(|a| a.position()).unwrap_or_default();
+        Some(chapters.iter().rposition(|c| c.start <= pos).unwrap_or(0))
+    }
+
+    /// The stretch the seek bar and times cover: the current chapter, or the
+    /// whole file when there are no chapters.
+    fn active_span(&self) -> (Duration, Duration) {
+        match self.current_chapter() {
+            Some(i) => {
+                let chapter = &self.chapters()[i];
+                (chapter.start, chapter.end)
+            }
+            None => (Duration::ZERO, self.duration()),
+        }
+    }
+
+    /// Absolute position in the file: the scrub preview mapped into the active
+    /// span while dragging, otherwise the player's real clock.
     fn position(&self) -> Duration {
         if let Some(scrub) = self.scrub {
-            return self.duration().mul_f32(scrub);
+            let (start, end) = self.active_span();
+            return start + end.saturating_sub(start).mul_f32(scrub);
         }
         self.audio
             .as_ref()
@@ -258,12 +297,36 @@ impl PlayerView {
             .unwrap_or_default()
     }
 
+    /// Elapsed time within the active span, starting from zero at its beginning.
+    fn elapsed(&self) -> Duration {
+        let (start, end) = self.active_span();
+        self.position()
+            .saturating_sub(start)
+            .min(end.saturating_sub(start))
+    }
+
+    /// Progress through the active span, 0..=1.
     fn progress(&self) -> f32 {
-        let duration = self.duration().as_secs_f32();
-        if duration <= 0.0 {
+        let (start, end) = self.active_span();
+        let len = end.saturating_sub(start).as_secs_f32();
+        if len <= 0.0 {
             return 0.0;
         }
-        (self.position().as_secs_f32() / duration).clamp(0.0, 1.0)
+        (self.elapsed().as_secs_f32() / len).clamp(0.0, 1.0)
+    }
+
+    /// The slice of decoded peaks inside the active span, so the bars show just
+    /// the current chapter.
+    fn span_peaks(&self) -> Vec<f32> {
+        let total = self.duration().as_secs_f32();
+        if total <= 0.0 || self.peaks.is_empty() {
+            return self.peaks.clone();
+        }
+        let (start, end) = self.active_span();
+        let n = self.peaks.len();
+        let a = (((start.as_secs_f32() / total) * n as f32).floor() as usize).min(n);
+        let b = (((end.as_secs_f32() / total) * n as f32).ceil() as usize).clamp(a, n);
+        self.peaks[a..b].to_vec()
     }
 
     // -- queue -------------------------------------------------------------
@@ -395,6 +458,49 @@ impl PlayerView {
         }
     }
 
+    fn seek_to(&mut self, pos: Duration, cx: &mut Context<Self>) {
+        if let Some(audio) = self.audio.as_mut() {
+            audio.seek(pos);
+        }
+        cx.notify();
+    }
+
+    /// Next: within a chaptered file, jump to the next chapter; at the last one
+    /// (or a plain file) move on to the next track in the queue.
+    fn skip_next(&mut self, cx: &mut Context<Self>) {
+        if let Some(i) = self.current_chapter() {
+            let chapters = self.chapters();
+            if i + 1 < chapters.len() {
+                let start = chapters[i + 1].start;
+                self.seek_to(start, cx);
+                return;
+            }
+        }
+        self.advance(true, cx);
+    }
+
+    /// Previous, chapter-aware: a few seconds into a chapter it restarts that
+    /// chapter, otherwise it steps back a chapter; before the first chapter it
+    /// falls back to the previous track.
+    fn skip_previous(&mut self, cx: &mut Context<Self>) {
+        let Some(i) = self.current_chapter() else {
+            self.previous(cx);
+            return;
+        };
+        let chapters = self.chapters();
+        let start = chapters[i].start;
+        let pos = self.audio.as_ref().map(|a| a.position()).unwrap_or_default();
+
+        if pos.saturating_sub(start) > Duration::from_secs(3) {
+            self.seek_to(start, cx);
+        } else if i > 0 {
+            let prev = chapters[i - 1].start;
+            self.seek_to(prev, cx);
+        } else {
+            self.previous(cx);
+        }
+    }
+
     fn toggle_play(&mut self, cx: &mut Context<Self>) {
         if self.queue.current.is_none() {
             if !self.queue.is_empty() {
@@ -516,8 +622,8 @@ impl PlayerView {
                 mpris::Command::Play if !self.is_playing() => self.toggle_play(cx),
                 mpris::Command::Pause if self.is_playing() => self.toggle_play(cx),
                 mpris::Command::Play | mpris::Command::Pause => {}
-                mpris::Command::Next => self.advance(true, cx),
-                mpris::Command::Previous => self.previous(cx),
+                mpris::Command::Next => self.skip_next(cx),
+                mpris::Command::Previous => self.skip_previous(cx),
                 mpris::Command::SetVolume(volume) => {
                     if let Some(audio) = self.audio.as_mut() {
                         audio.set_volume(volume);
@@ -559,14 +665,15 @@ impl PlayerView {
         cx.notify();
     }
 
-    /// Commits the preview: one seek, on release.
+    /// Commits the preview: one seek, on release, within the active span.
     fn commit_scrub(&mut self, cx: &mut Context<Self>) {
         let Some(fraction) = self.scrub.take() else {
             return;
         };
-        let duration = self.duration();
+        let (start, end) = self.active_span();
+        let target = start + end.saturating_sub(start).mul_f32(fraction);
         if let Some(audio) = self.audio.as_mut() {
-            audio.seek(duration.mul_f32(fraction));
+            audio.seek(target);
         }
         cx.notify();
     }
@@ -672,7 +779,7 @@ impl PlayerView {
     }
 
     fn waveform(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let peaks = self.peaks.clone();
+        let peaks = self.span_peaks();
         let progress = self.progress();
         let bounds_cell = self.seek_bounds.clone();
 
@@ -735,8 +842,9 @@ impl PlayerView {
     }
 
     fn times(&self) -> impl IntoElement {
-        let position = self.position();
-        let remaining = self.duration().saturating_sub(position);
+        let (start, end) = self.active_span();
+        let elapsed = self.elapsed();
+        let remaining = end.saturating_sub(start).saturating_sub(elapsed);
 
         div()
             .flex()
@@ -744,20 +852,27 @@ impl PlayerView {
             .justify_between()
             .text_size(px(12.))
             .text_color(theme::text_dim())
-            .child(format_time(position))
+            .child(format_time(elapsed))
             .child(format!("−{}", format_time(remaining)))
     }
 
     fn meta(&self) -> impl IntoElement {
         let track = self.queue.current_track();
+        let chapter = self.current_chapter();
+
+        // With chapters the song title leads and the file's own title steps back
+        // to the album line; the counter shows the position within the album.
         let (title, artist, album) = match track {
-            Some(track) => (
-                track.title.clone(),
-                track.artist.clone(),
-                track.album.clone(),
-            ),
+            Some(track) => {
+                let title = match chapter {
+                    Some(i) => self.chapters()[i].title.clone(),
+                    None => track.title.clone(),
+                };
+                (title, track.artist.clone(), track.album.clone())
+            }
             None => ("Nothing playing".into(), "".into(), "".into()),
         };
+        let counter = chapter.map(|i| format!("{} / {}", i + 1, self.chapters().len()));
 
         div()
             .flex()
@@ -782,6 +897,15 @@ impl PlayerView {
                     .child(artist)
                     .child(album),
             )
+            .when_some(counter, |this, counter| {
+                this.child(
+                    div()
+                        .mt_0p5()
+                        .text_size(px(11.))
+                        .text_color(theme::text_faint())
+                        .child(counter),
+                )
+            })
     }
 
     fn controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -797,7 +921,7 @@ impl PlayerView {
                 "icons/previous.svg",
                 px(40.),
                 px(16.),
-                cx.listener(|this, _, _, cx| this.previous(cx)),
+                cx.listener(|this, _, _, cx| this.skip_previous(cx)),
             ))
             .child(icon_button(
                 "play",
@@ -815,7 +939,7 @@ impl PlayerView {
                 "icons/next.svg",
                 px(40.),
                 px(16.),
-                cx.listener(|this, _, _, cx| this.advance(true, cx)),
+                cx.listener(|this, _, _, cx| this.skip_next(cx)),
             ))
     }
 

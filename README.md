@@ -76,6 +76,36 @@ MP3, FLAC, WAV, AAC/M4A and Ogg Vorbis are handled by Symphonia (through rodio).
 container is demuxed by the `ogg` crate and the codec itself is decoded by libopus. It implements
 `rodio::Source`, including seeking via the granule positions of Ogg pages.
 
+## Metadata cache
+
+Reading a track's tags means opening and parsing the file, and a library scan does it once per
+file on every launch. That is free on a local disk and expensive on a network mount, where an open
+can pull down megabytes before the tags at the front of the file are even reachable.
+
+So the result is remembered. After a file has been parsed once, hark writes what it found into
+that file's own `user.hark.meta` extended attribute (`src/meta_cache.rs`), and later scans read it
+back with a `stat` and a `getxattr` — no opens at all. The startup line says how many tracks came
+from it:
+
+```
+hark: tracks queued: 1000 (964 cached) in 1.2s
+```
+
+The record holds the tags, the duration, the chapters and a single bit saying the file has a
+cover — never the cover itself, which is read only when the track actually plays. It is stamped
+with the file's modification time and size, and that stamp is checked on every read, so re-tagging
+a file invalidates its record by itself. Keeping the record in the file rather than in an index
+somewhere else means a rename carries it along, and on a filesystem that replicates its own
+metadata it reaches another machine without hark doing anything.
+
+Nothing here is load-bearing. A filesystem without extended attributes, a read-only mount or a
+record hark cannot make sense of all mean the same thing — parse the file, as before. The only
+symptom is that every run reports `(0 cached)`. To drop a record by hand:
+
+```
+setfattr -x user.hark.meta track.flac
+```
+
 ## Audio
 
 The output device is opened at the sample rate of the track being played. Without that, rodio

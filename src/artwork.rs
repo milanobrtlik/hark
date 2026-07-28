@@ -14,13 +14,16 @@ use std::time::Duration;
 
 /// Decodes image bytes into a GPUI image, sniffing the format from the leading
 /// magic bytes rather than trusting a MIME string. Shared by embedded-tag art
-/// (`track::Track::load`) and the internet cache.
+/// (`track::embedded_art`) and the internet cache.
 pub fn decode(bytes: Vec<u8>) -> Option<Arc<Image>> {
     let format = sniff(&bytes)?;
     Some(Arc::new(Image::from_bytes(format, bytes)))
 }
 
-fn sniff(b: &[u8]) -> Option<ImageFormat> {
+/// Whether these bytes are a picture hark can display, without decoding them.
+/// A scan uses this to note that a file carries usable art while leaving the
+/// bytes in the file.
+pub(crate) fn sniff(b: &[u8]) -> Option<ImageFormat> {
     if b.starts_with(&[0xFF, 0xD8, 0xFF]) {
         Some(ImageFormat::Jpeg)
     } else if b.starts_with(&[0x89, b'P', b'N', b'G']) {

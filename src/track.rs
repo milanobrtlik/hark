@@ -1,3 +1,4 @@
+use crate::meta_cache;
 use gpui::{Image, SharedString};
 use lofty::config::ParseOptions;
 use lofty::file::{AudioFile, TaggedFileExt};
@@ -25,6 +26,23 @@ pub struct Chapter {
     pub end: Duration,
 }
 
+/// Everything about a file that survives a rescan: what its tags said, how long
+/// it plays, where its chapters are and whether it carries a picture. This is
+/// exactly the record `meta_cache` keeps in the file's extended attribute, so a
+/// cache hit and a fresh parse produce the same `Track`.
+#[derive(Clone, Default)]
+pub struct Meta {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub duration: Duration,
+    pub chapters: Vec<Chapter>,
+    /// The file carries a picture hark can display. The picture itself is not
+    /// read here: a scan would pull in the image bytes of the whole library for
+    /// the sake of the one track that is playing.
+    pub has_art: bool,
+}
+
 #[derive(Clone)]
 pub struct Track {
     pub path: PathBuf,
@@ -32,9 +50,13 @@ pub struct Track {
     pub artist: SharedString,
     pub album: SharedString,
     pub duration: Duration,
+    /// The cover, once something has actually fetched or decoded one. A freshly
+    /// scanned track has none even when its file holds one — see `has_art`.
     pub art: Option<Arc<Image>>,
     /// Embedded chapters, if any — empty for an ordinary single-song file.
     pub chapters: Vec<Chapter>,
+    /// The file has a cover of its own, to be decoded when it starts playing.
+    pub has_art: bool,
 }
 
 pub const SUPPORTED: [&str; 8] = ["mp3", "flac", "ogg", "oga", "wav", "m4a", "aac", "opus"];
@@ -47,52 +69,120 @@ pub fn is_supported(path: &Path) -> bool {
 }
 
 impl Track {
-    /// Reads tags, cover art and duration. Falls back to the file name when a
-    /// file carries no tags at all.
-    pub fn load(path: PathBuf) -> Track {
+    /// Reads a track, preferring the record the last scan left in the file's
+    /// extended attribute — on a hit the file is only stat'ed, never opened,
+    /// which is what makes a rescan free on a network mount. The returned flag
+    /// says whether that happened, so a scan can report how much it saved.
+    pub fn load(path: PathBuf) -> (Track, bool) {
+        let stamp = std::fs::metadata(&path)
+            .ok()
+            .map(|metadata| meta_cache::stamp(&metadata));
+
+        if let Some(stamp) = stamp
+            && let Some(meta) = meta_cache::read(&path, stamp)
+        {
+            return (Track::from_meta(path, meta), true);
+        }
+
+        let Some(meta) = parse(&path) else {
+            // The file could not be read at all. That is a transient condition —
+            // a half-copied file, a hiccup on the mount — and must not be frozen
+            // into the file as a record saying it has nothing.
+            return (Track::from_meta(path, Meta::default()), false);
+        };
+
+        if let Some(stamp) = stamp {
+            meta_cache::write(&path, stamp, &meta);
+        }
+        (Track::from_meta(path, meta), false)
+    }
+
+    /// The one way a `Track` is built, so a cache hit and a cold parse cannot
+    /// drift apart. Falls back to the file name when the file carries no title —
+    /// which is why the cached record leaves an absent tag out instead of
+    /// storing a placeholder: a renamed file has to follow its new name.
+    pub fn from_meta(path: PathBuf, meta: Meta) -> Track {
         let stem = path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("Unknown track")
             .to_string();
 
-        let mut track = Track {
-            title: stem.into(),
-            artist: UNKNOWN_ARTIST.into(),
-            album: UNKNOWN_ALBUM.into(),
-            duration: Duration::ZERO,
+        Track {
+            title: named(meta.title, stem),
+            artist: named(meta.artist, UNKNOWN_ARTIST),
+            album: named(meta.album, UNKNOWN_ALBUM),
+            duration: meta.duration,
             art: None,
-            chapters: Vec::new(),
-            path: path.clone(),
-        };
-
-        let Ok(tagged) = Probe::open(&path).and_then(|p| p.read()) else {
-            return track;
-        };
-
-        track.duration = tagged.properties().duration();
-        track.chapters = read_chapters(&path, track.duration);
-
-        let tag = tagged.primary_tag().or_else(|| tagged.first_tag());
-        let Some(tag) = tag else { return track };
-
-        if let Some(title) = tag.title().filter(|t| !t.trim().is_empty()) {
-            track.title = title.to_string().into();
+            chapters: meta.chapters,
+            has_art: meta.has_art,
+            path,
         }
-        if let Some(artist) = tag.artist().filter(|t| !t.trim().is_empty()) {
-            track.artist = artist.to_string().into();
-        }
-        if let Some(album) = tag.album().filter(|t| !t.trim().is_empty()) {
-            track.album = album.to_string().into();
-        }
-
-        track.art = tag
-            .pictures()
-            .iter()
-            .find_map(|picture| crate::artwork::decode(picture.data().to_vec()));
-
-        track
     }
+}
+
+/// A tag's value, or the given stand-in when the file carried none.
+fn named(value: Option<String>, fallback: impl Into<SharedString>) -> SharedString {
+    match value {
+        Some(value) => value.into(),
+        None => fallback.into(),
+    }
+}
+
+/// Reads the file itself. `None` means it could not be opened or parsed, and the
+/// caller must not cache that. A file that opens cleanly but carries no tag is a
+/// definitive answer rather than a failure, and comes back as `Some`.
+fn parse(path: &Path) -> Option<Meta> {
+    let Ok(tagged) = Probe::open(path).and_then(|p| p.read()) else {
+        return None;
+    };
+
+    let duration = tagged.properties().duration();
+    let mut meta = Meta {
+        duration,
+        chapters: read_chapters(path, duration),
+        ..Meta::default()
+    };
+
+    let tag = tagged.primary_tag().or_else(|| tagged.first_tag());
+    let Some(tag) = tag else { return Some(meta) };
+
+    meta.title = tag
+        .title()
+        .filter(|t| !t.trim().is_empty())
+        .map(|t| t.to_string());
+    meta.artist = tag
+        .artist()
+        .filter(|t| !t.trim().is_empty())
+        .map(|t| t.to_string());
+    meta.album = tag
+        .album()
+        .filter(|t| !t.trim().is_empty())
+        .map(|t| t.to_string());
+
+    // Only whether a usable picture is there; the bytes stay in the file until
+    // the track actually plays. Sniffing rather than decoding also keeps the
+    // record honest — a tag holding nothing but a BMP does not decode here, so
+    // recording it as art would send the player after bytes it cannot use.
+    meta.has_art = tag
+        .pictures()
+        .iter()
+        .any(|picture| crate::artwork::sniff(picture.data()).is_some());
+
+    Some(meta)
+}
+
+/// Decodes the first usable picture embedded in a file. This opens the file, so
+/// it is only ever called for the track about to play: the scan records that a
+/// picture exists (`Track::has_art`) without keeping a single byte of it.
+pub fn embedded_art(path: &Path) -> Option<Arc<Image>> {
+    let Ok(tagged) = Probe::open(path).and_then(|p| p.read()) else {
+        return None;
+    };
+    let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
+    tag.pictures()
+        .iter()
+        .find_map(|picture| crate::artwork::decode(picture.data().to_vec()))
 }
 
 /// `1:06`, and `-1:49` for the remaining side.

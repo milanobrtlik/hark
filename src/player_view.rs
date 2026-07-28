@@ -24,7 +24,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const SHADOW_SIZE: Pixels = px(10.);
 const CORNER: Pixels = px(14.);
@@ -52,6 +52,14 @@ struct VolumeDrag;
 
 /// What the two-stage cover/identify task found, applied back on the main thread.
 enum Outcome {
+    /// A cover decoded out of the file itself: fill that one track. `release`
+    /// carries back the album key reserved before the task ran — iTunes was
+    /// never asked, so a sibling track without a picture must still get to.
+    TrackCover {
+        path: PathBuf,
+        image: Arc<gpui::Image>,
+        release: Option<String>,
+    },
     /// An iTunes cover for an album: fill every track sharing the key.
     AlbumCover { key: String, image: Arc<gpui::Image> },
     /// A fingerprint identity for one file: fill that file (cover + metadata).
@@ -65,6 +73,22 @@ enum Outcome {
     /// A transient fingerprint failure — free the path so it retries.
     RetryPath { path: PathBuf },
     Nothing,
+}
+
+/// Which filesystem events are worth a rescan. Metadata-only changes are not:
+/// hark stamps every file it parses with an extended attribute, and every one of
+/// those writes comes straight back as an attribute-change event. Without this
+/// filter the first, cold scan would keep rescheduling itself for as long as it
+/// ran — a full recursive walk of the folder roughly every second and a half,
+/// alongside the scan already in flight. Content writes and renames do change
+/// the set of files, so they stay.
+fn is_library_change(kind: &notify::EventKind) -> bool {
+    use notify::event::{EventKind, ModifyKind};
+
+    if let EventKind::Modify(ModifyKind::Metadata(_)) = kind {
+        return false;
+    }
+    kind.is_create() || kind.is_remove() || kind.is_modify()
 }
 
 /// Overwrites a track's metadata with what AcoustID recovered, leaving any field
@@ -193,7 +217,7 @@ impl PlayerView {
 
         let mut watcher = match notify::recommended_watcher(move |event| {
             if let Ok(notify::Event { kind, .. }) = event
-                && (kind.is_create() || kind.is_remove() || kind.is_modify())
+                && is_library_change(&kind)
             {
                 let _ = tx.send(());
             }
@@ -415,9 +439,10 @@ impl PlayerView {
     /// With `autoplay`, playback starts if nothing is playing yet.
     fn add_paths(&mut self, paths: Vec<PathBuf>, autoplay: bool, cx: &mut Context<Self>) {
         let known: HashSet<PathBuf> = self.queue.tracks.iter().map(|t| t.path.clone()).collect();
+        let started = Instant::now();
 
         cx.spawn(async move |this, cx| {
-            let tracks = cx
+            let (tracks, cached) = cx
                 .background_executor()
                 .spawn(async move {
                     let mut files = Vec::new();
@@ -426,11 +451,22 @@ impl PlayerView {
                     }
                     files.sort();
                     files.dedup();
-                    files
+
+                    // How many came out of the files' own metadata cache rather
+                    // than a parse. On a filesystem without extended attributes
+                    // this stays at zero every run, which is the signal that the
+                    // cache is doing nothing there.
+                    let mut cached = 0usize;
+                    let tracks: Vec<Track> = files
                         .into_iter()
                         .filter(|path| !known.contains(path))
-                        .map(Track::load)
-                        .collect::<Vec<_>>()
+                        .map(|path| {
+                            let (track, hit) = Track::load(path);
+                            cached += hit as usize;
+                            track
+                        })
+                        .collect();
+                    (tracks, cached)
                 })
                 .await;
 
@@ -438,7 +474,11 @@ impl PlayerView {
                 if tracks.is_empty() {
                     return;
                 }
-                eprintln!("hark: tracks queued: {}", tracks.len());
+                eprintln!(
+                    "hark: tracks queued: {} ({cached} cached) in {:.1}s",
+                    tracks.len(),
+                    started.elapsed().as_secs_f32()
+                );
                 let idle = this.queue.current.is_none();
                 this.queue.extend(tracks);
                 if autoplay && idle {
@@ -491,8 +531,11 @@ impl PlayerView {
     }
 
     /// Finds a cover — and, as a last resort, correct metadata — for the current
-    /// track when it has none. Two stages run in one background task:
+    /// track when it has none. Three stages run in one background task:
     ///
+    /// 0. **The file's own picture**, when the scan saw one. The bytes were left
+    ///    in the file so that scanning a library would not drag every cover into
+    ///    memory; this is where they are finally read, for the one track playing.
     /// 1. **Tags → iTunes** when the artist and album are real: on a hit every
     ///    queued track sharing the album is filled; each album is tried once.
     /// 2. **Fingerprint → AcoustID** when the tags are unusable, or when iTunes
@@ -512,8 +555,10 @@ impl PlayerView {
             && track.album != crate::track::UNKNOWN_ALBUM;
         let fp_enabled = fingerprint::API_KEY.is_some();
 
-        // Stage 1 is deduped by album key; the fingerprint fallback for a
-        // tag-less file is deduped by path. A track is only ever one or the other.
+        // Stage 0 needs no bookkeeping: it fills the one track it read, which
+        // then has art and never comes back here. Stage 1 is deduped by album
+        // key; the fingerprint fallback for a tag-less file is deduped by path.
+        let run_embedded = track.has_art;
         let album_key = tag_known.then(|| artwork::key(&track.artist, &track.album));
         let run_itunes = match &album_key {
             Some(key) => self.cover_keys.insert(key.clone()),
@@ -521,7 +566,7 @@ impl PlayerView {
         };
         let run_fingerprint_directly =
             !tag_known && fp_enabled && self.fp_paths.insert(track.path.clone());
-        if !run_itunes && !run_fingerprint_directly {
+        if !run_embedded && !run_itunes && !run_fingerprint_directly {
             return;
         }
 
@@ -535,9 +580,26 @@ impl PlayerView {
             let outcome = cx
                 .background_executor()
                 .spawn(async move {
+                    // Stage 0: the picture in the file. One open, no network.
+                    if run_embedded {
+                        if let Some(image) = crate::track::embedded_art(&path) {
+                            return Outcome::TrackCover {
+                                path,
+                                image,
+                                release: album_key,
+                            };
+                        }
+                        // The picture went away between the scan and now. Fall
+                        // through only into a stage that was actually reserved:
+                        // the fingerprint below was never deduped for this path,
+                        // and would run again on every play.
+                        if !run_itunes && !run_fingerprint_directly {
+                            return Outcome::Nothing;
+                        }
+                    }
+
                     // Stage 1: tags → iTunes.
-                    if run_itunes {
-                        let key = album_key.expect("run_itunes implies an album key");
+                    if run_itunes && let Some(key) = album_key {
                         let (image, transient) = artwork::load_or_fetch(&artist, &album);
                         if let Some(image) = image {
                             return Outcome::AlbumCover { key, image };
@@ -561,11 +623,37 @@ impl PlayerView {
                 .await;
 
             this.update(cx, |this, cx| match outcome {
+                Outcome::TrackCover {
+                    path,
+                    image,
+                    release,
+                } => {
+                    // Only this file: the picture came out of it.
+                    if let Some(track) =
+                        this.queue.tracks.iter_mut().find(|track| track.path == path)
+                        && track.art.is_none()
+                    {
+                        track.art = Some(image);
+                    }
+                    // iTunes was never asked about this album, so hand its key
+                    // back — a sibling track carrying no picture of its own
+                    // still needs someone to ask.
+                    if let Some(key) = release {
+                        this.cover_keys.remove(&key);
+                    }
+                    cx.notify();
+                }
                 Outcome::AlbumCover { key, image } => {
                     // Indices may have shifted since the fetch began, so match by
                     // key; this also fills sibling and per-chapter tracks at once.
+                    // A track with a picture of its own is left alone: it decodes
+                    // that one when it plays, and after the scan every track has
+                    // `art: None`, so nothing else would tell them apart.
                     for track in &mut this.queue.tracks {
-                        if track.art.is_none() && artwork::key(&track.artist, &track.album) == key {
+                        if track.art.is_none()
+                            && !track.has_art
+                            && artwork::key(&track.artist, &track.album) == key
+                        {
                             track.art = Some(image.clone());
                         }
                     }
@@ -573,7 +661,9 @@ impl PlayerView {
                 }
                 Outcome::Identified { path, id, image } => {
                     // Fill only the file that was fingerprinted — two unrelated
-                    // badly-tagged files must not share one identity.
+                    // badly-tagged files must not share one identity. `has_art`
+                    // is deliberately not consulted here: this path is reached
+                    // precisely when the file's own picture did not work out.
                     for track in &mut this.queue.tracks {
                         if track.path != path {
                             continue;

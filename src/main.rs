@@ -3,6 +3,7 @@ mod audio;
 mod decode;
 mod fingerprint;
 mod library;
+mod meta_cache;
 mod mpris;
 mod opus_source;
 mod player_view;

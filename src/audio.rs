@@ -58,11 +58,13 @@ fn open_device(rate: Option<SampleRate>) -> Result<MixerDeviceSink> {
 }
 
 impl Audio {
-    pub fn new() -> Result<Audio> {
+    /// `volume` comes from the last session — the audio layer has no business
+    /// choosing a number the listener set.
+    pub fn new(volume: f32) -> Result<Audio> {
         let device = open_device(None)?;
         let rate = device.config().sample_rate();
         let player = Player::connect_new(device.mixer());
-        let volume = 0.7;
+        let volume = volume.clamp(0.0, 1.0);
         let fade = 1.0;
         player.set_volume(volume * fade);
 
@@ -77,13 +79,19 @@ impl Audio {
         })
     }
 
-    pub fn play_file(&mut self, path: &Path) -> Result<()> {
+    /// Loads `path` into the player. With `audible` false the track is loaded
+    /// and ready but silent, which is how a session resumes: the waveform, the
+    /// cover and the clock come up where they were left and nothing is heard
+    /// until the listener asks for it.
+    pub fn play_file(&mut self, path: &Path, audible: bool) -> Result<()> {
         let source = decode::open(path)?;
         let track_rate = source.sample_rate();
 
         // A fresh track always plays at full player gain; any play/pause fade
-        // left over belongs to the previous track.
-        self.fade = 1.0;
+        // left over belongs to the previous track. A silent load starts at zero
+        // instead, so the first press of play eases in exactly as a resume from
+        // pause does.
+        self.fade = if audible { 1.0 } else { 0.0 };
 
         // Reopen the device at the track's own rate when it differs, so the
         // samples reach the sink untouched.
@@ -99,9 +107,13 @@ impl Audio {
         self.player.clear();
         self.player.append(source);
         self.player.set_volume(self.effective());
-        self.player.play();
+        // `clear` above leaves the player paused, so a silent load simply never
+        // asks it to start — not a frame of the track escapes before the seek.
+        if audible {
+            self.player.play();
+        }
         self.loaded = true;
-        self.playing = true;
+        self.playing = audible;
         Ok(())
     }
 

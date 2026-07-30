@@ -57,6 +57,26 @@ Tracks can also be added by dropping them onto the window or with the `+` button
 
 Space toggles play/pause.
 
+## Where it left off
+
+Started with no arguments, hark comes back to the track it was on, seeked to where it stopped —
+**paused**. The waveform, the cover and the clock are all where you left them, and nothing is heard
+until you press play. Naming files on the command line takes over as before; the remembered session
+is then left alone.
+
+The session is kept in `~/.local/state/hark/state.json` (`XDG_STATE_HOME`), along with the volume,
+shuffle, repeat, whether the queue panel was open and how big the window was. It is written when
+hark quits and every few seconds while something is playing, so a crash or a `kill` costs a few
+seconds rather than the whole session. Delete the file to forget everything:
+
+```
+rm ~/.local/state/hark/state.json
+```
+
+Two things it does not restore. A track stopped within five seconds of its end starts from the
+beginning instead — it had effectively finished. And the window's *position* comes back only as a
+size: Wayland never tells a client where its window is, so the compositor places it.
+
 ## Media keys
 
 The keyboard's play/pause key cannot be handled as a key binding: the compositor grabs the

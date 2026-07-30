@@ -10,6 +10,7 @@ mod opus_source;
 mod peak_cache;
 mod player_view;
 mod queue;
+mod state;
 mod theme;
 mod track;
 mod ui;
@@ -46,6 +47,9 @@ impl AssetSource for Assets {
 
 fn main() {
     let paths: Vec<std::path::PathBuf> = std::env::args_os().skip(1).map(Into::into).collect();
+    // Read once, here: the window is sized before the view that owns the rest of
+    // the session exists, so both come out of one snapshot.
+    let state = state::load();
 
     Application::new().with_assets(Assets).run(move |cx: &mut App| {
         cx.bind_keys([KeyBinding::new(
@@ -54,7 +58,18 @@ fn main() {
             Some(player_view::KEY_CONTEXT),
         )]);
 
-        let bounds = Bounds::centered(None, size(px(420.), px(690.)), cx);
+        // Wayland never tells a client where its window is — the origin comes
+        // back as zero however the compositor placed it — so a zero origin means
+        // "put it wherever you would have" rather than "the top left corner".
+        let window = state.window;
+        let extent = window.map_or(state::DEFAULT_SIZE, |window| window.size);
+        let origin = window
+            .map(|window| window.origin)
+            .filter(|origin| origin.x > px(0.) || origin.y > px(0.));
+        let bounds = match origin {
+            Some(origin) => Bounds::new(origin, extent),
+            None => Bounds::centered(None, extent, cx),
+        };
 
         cx.open_window(
             WindowOptions {
@@ -66,7 +81,7 @@ fn main() {
                 app_id: Some("dev.milan.hark".into()),
                 ..Default::default()
             },
-            |window, cx| cx.new(|cx| PlayerView::new(paths, window, cx)),
+            |window, cx| cx.new(|cx| PlayerView::new(paths, state, window, cx)),
         )
         .expect("failed to open the window");
 

@@ -4,6 +4,7 @@ use crate::fingerprint::{self, Identification};
 use crate::library;
 use crate::mpris::{self, Mpris};
 use crate::queue::{Queue, Repeat};
+use crate::state;
 use crate::theme;
 use crate::track::{Chapter, Track, format_time};
 use crate::ui::{bar, fraction_at, icon_button, rounded, toggle_button};
@@ -153,14 +154,63 @@ pub struct PlayerView {
     _tick: Task<()>,
     /// Watches the music folder. Dropping it stops the notifications.
     _watcher: Option<notify::RecommendedWatcher>,
+    /// The track the last session stopped on, waiting for a scan that contains
+    /// it. Given up the moment anything else starts playing.
+    resume: Option<Resume>,
+    /// The window as the compositor last reported it. Kept because the quit hook
+    /// runs with no `Window` left to ask.
+    window: Bounds<Pixels>,
+    /// The session as last written, and when. Compared every few seconds, so an
+    /// idle player writes nothing at all.
+    saved: state::State,
+    saved_at: Instant,
 }
 
+/// Where the last session stopped, until a scan turns its file up.
+struct Resume {
+    path: PathBuf,
+    position: Duration,
+}
+
+/// A track stopped within this of its end resumes from the start instead. It had
+/// effectively finished, and its last few seconds are not where anyone left off.
+const RESUME_MARGIN: Duration = Duration::from_secs(5);
+
+/// How often the session is written while it is changing. The quit hook writes
+/// the final state itself; this is what survives a signal, a crash or a logout,
+/// which never reach that hook — so it is frequent enough to lose nothing anyone
+/// would notice and rare enough to be invisible.
+const SAVE_EVERY: Duration = Duration::from_secs(5);
+
 impl PlayerView {
-    pub fn new(paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        paths: Vec<PathBuf>,
+        state: state::State,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         cx.observe_window_appearance(window, |_, window, _| window.refresh())
             .detach();
 
-        let (audio, error) = match Audio::new() {
+        cx.observe_window_bounds(window, |this, window, _| {
+            // `get_bounds` reports a maximized window's restore size, which is
+            // the one worth coming back to.
+            this.window = window.window_bounds().get_bounds();
+        })
+        .detach();
+
+        // The only save guaranteed to hold the final position. It runs for the
+        // close button and for `cx.quit()`, which are the only polite ways out —
+        // MPRIS cannot quit hark at all. Synchronous, because quit observers are
+        // given a hundred milliseconds and a background spawn may never be
+        // polled inside it.
+        cx.on_app_quit(|this, _| {
+            state::save(&this.snapshot());
+            std::future::ready(())
+        })
+        .detach();
+
+        let (audio, error) = match Audio::new(state.volume) {
             Ok(audio) => (Some(audio), None),
             Err(err) => (None, Some(SharedString::from(err.to_string()))),
         };
@@ -195,7 +245,27 @@ impl PlayerView {
             _fade_task: None,
             _tick: Self::spawn_tick(cx),
             _watcher: None,
+            // Files named on the command line are what was actually asked for,
+            // so the remembered session is not armed at all in that case. That
+            // also settles the race: the argv batch and a restore can never both
+            // want the player, whichever scan lands first.
+            resume: paths
+                .is_empty()
+                .then(|| {
+                    state.track.clone().map(|path| Resume {
+                        path,
+                        position: state.position,
+                    })
+                })
+                .flatten(),
+            window: window.window_bounds().get_bounds(),
+            saved: state.clone(),
+            saved_at: Instant::now(),
         };
+
+        view.queue.set_shuffle(state.shuffle);
+        view.queue.repeat = state.repeat;
+        view.show_playlist = state.playlist;
 
         // Files named on the command line play straight away; the music folder
         // is only loaded into the queue.
@@ -301,6 +371,7 @@ impl PlayerView {
                 let alive = this
                     .update(cx, |this, cx| {
                         this.sync_mpris(cx);
+                        this.save_if_due(cx);
 
                         let finished = this.audio.as_ref().is_some_and(|a| a.finished());
                         if finished {
@@ -483,6 +554,8 @@ impl PlayerView {
                 this.queue.extend(tracks);
                 if autoplay && idle {
                     this.play_index(0, cx);
+                } else if idle {
+                    this.restore(cx);
                 }
                 cx.notify();
             })
@@ -491,7 +564,18 @@ impl PlayerView {
         .detach();
     }
 
+    /// Starts the track at `index`. Every path that begins playback comes
+    /// through here, which is also where the remembered session is given up:
+    /// once the listener has played something, restoring what they were doing
+    /// yesterday would be taking the player away from them.
     fn play_index(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.resume = None;
+        self.open(index, Duration::ZERO, true, cx);
+    }
+
+    /// Loads the track at `index`, positioned at `at`. With `audible` false it
+    /// comes up shown but silent.
+    fn open(&mut self, index: usize, at: Duration, audible: bool, cx: &mut Context<Self>) {
         let Some(track) = self.queue.tracks.get(index).cloned() else {
             return;
         };
@@ -501,9 +585,12 @@ impl PlayerView {
             return;
         };
 
-        if let Err(err) = audio.play_file(&track.path) {
+        if let Err(err) = audio.play_file(&track.path, audible) {
             self.error = Some(err.to_string().into());
             return;
+        }
+        if !at.is_zero() {
+            audio.seek(at);
         }
 
         self.error = None;
@@ -512,6 +599,99 @@ impl PlayerView {
         self.load_waveform(track.path, cx);
         self.ensure_cover(cx);
         cx.notify();
+    }
+
+    /// Picks the last session back up, once a scan has actually brought its file
+    /// into the queue. Paused: the waveform, the cover and the clock come up
+    /// where they were left, and nothing is heard until asked.
+    ///
+    /// Tried after every batch that lands while nothing is playing, because the
+    /// file may arrive with the folder scan, with a rescan after the mount came
+    /// up late, or never. Not finding it is not a failure — the latch stays
+    /// armed and the player sits exactly as it does today with no arguments.
+    fn restore(&mut self, cx: &mut Context<Self>) {
+        let Some(resume) = self.resume.as_ref() else {
+            return;
+        };
+        let Some(index) = self
+            .queue
+            .tracks
+            .iter()
+            .position(|track| track.path == resume.path)
+        else {
+            return;
+        };
+
+        let at = resume.position;
+        self.resume = None;
+        self.open(index, at, false, cx);
+    }
+
+    /// The session as it stands, in the shape the state file keeps it.
+    fn snapshot(&self) -> state::State {
+        // The real position in the file, never `elapsed()`: that one is measured
+        // from the start of the current chapter, and chapters are something the
+        // view does to a file the player knows only as a whole. Seeking back to
+        // an absolute position puts the view in the right chapter by itself.
+        let played = self
+            .audio
+            .as_ref()
+            .map(|audio| audio.position())
+            .unwrap_or_default();
+        let duration = self.duration();
+        let finished = !duration.is_zero() && played + RESUME_MARGIN >= duration;
+
+        let (track, position) = match self.queue.current_track() {
+            Some(track) => (
+                Some(track.path.clone()),
+                if finished { Duration::ZERO } else { played },
+            ),
+            // Nothing has played yet, so the session worth keeping is still the
+            // one that was restored — or would have been, had its file turned
+            // up. Without this, opening hark and closing it again forgets where
+            // you were.
+            None => match &self.resume {
+                Some(resume) => (Some(resume.path.clone()), resume.position),
+                None => (None, Duration::ZERO),
+            },
+        };
+
+        state::State {
+            track,
+            position,
+            volume: self
+                .audio
+                .as_ref()
+                .map(|audio| audio.volume())
+                .unwrap_or(state::DEFAULT_VOLUME),
+            shuffle: self.queue.shuffle,
+            repeat: self.queue.repeat,
+            playlist: self.show_playlist,
+            window: Some(self.window),
+        }
+    }
+
+    /// Writes the session out now and then, so a signal or a crash — neither of
+    /// which reaches the quit hook — costs at most the last few seconds. The
+    /// comparison is what keeps this quiet: a paused player's snapshot does not
+    /// change, so it writes nothing at all.
+    fn save_if_due(&mut self, cx: &mut Context<Self>) {
+        if self.saved_at.elapsed() < SAVE_EVERY {
+            return;
+        }
+        self.saved_at = Instant::now();
+
+        let snapshot = self.snapshot();
+        if snapshot == self.saved {
+            return;
+        }
+        self.saved = snapshot.clone();
+
+        // Off the main thread: it is a few hundred bytes to a local disk, but
+        // the tick this runs on is what keeps the seek bar moving.
+        cx.background_executor()
+            .spawn(async move { state::save(&snapshot) })
+            .detach();
     }
 
     /// The lookup stays on the background executor with the decode, cheap as it

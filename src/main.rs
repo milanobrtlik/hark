@@ -2,6 +2,7 @@ mod artwork;
 mod audio;
 mod decode;
 mod fingerprint;
+mod id_cache;
 mod library;
 mod meta_cache;
 mod mpris;

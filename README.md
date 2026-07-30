@@ -122,6 +122,21 @@ Its version byte moves when the measurement changes, not only when the record's 
 the tags, which mirror what is in the file, these mirror a calculation — so a changed calculation
 makes every stored record wrong about a file that has not moved, and the stamp cannot catch it.
 
+### What AcoustID said — `user.hark.id`
+
+When a file's tags are too poor to find a cover from, hark identifies it by its sound instead:
+two minutes of audio decoded, run through a Chromaprint fingerprint and put to a rate-limited web
+service — once per chapter, for a full-album rip. The answer is the album's MusicBrainz id and the
+titles of its songs, and it is kept.
+
+A record carrying no id means AcoustID was asked and did not know, which is worth remembering just
+as much: without it every play fingerprints the file again for the same silence. A lookup that
+failed on the network is not recorded, so it is retried.
+
+This replaces a cache under `~/.cache/hark/fingerprints`, which was keyed on the path, was lost on a
+rename and never left the machine it was written on. **That folder is no longer used and can be
+deleted.**
+
 ### Dropping a record
 
 Nothing here is load-bearing. A filesystem without extended attributes, a read-only mount or a
@@ -133,6 +148,7 @@ may simply not fit, and stays on the slow path.
 ```
 setfattr -x user.hark.meta  track.flac   # the tags
 setfattr -x user.hark.peaks track.flac   # the waveform
+setfattr -x user.hark.id    track.flac   # what AcoustID said
 ```
 
 Album covers are the exception to all of this. Image bytes are far too big for an attribute, whose

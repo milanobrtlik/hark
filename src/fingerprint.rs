@@ -8,20 +8,19 @@
 //! the whole file shares one album cover.
 //!
 //! This is the heavier "identify unknown music" path, so it runs only as a
-//! fallback, on the GPUI background executor, and each file's result is cached.
+//! fallback, on the GPUI background executor, and each file's answer is kept in
+//! the file's own extended attribute (`src/id_cache.rs`).
 
 use crate::artwork;
 use crate::decode;
 use crate::track::Track;
+use crate::{id_cache, meta_cache};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rodio::Source;
 use rusty_chromaprint::{Configuration, FingerprintCompressor, Fingerprinter};
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 /// The AcoustID application key, baked in from `.env` at build time (see
 /// `build.rs`). `None` when none was configured — the caller then skips the
@@ -60,32 +59,33 @@ pub struct Identification {
 
 /// Identifies `track` from its audio, or returns `None` when it can't be matched
 /// confidently. Blocking (decode + FFT + HTTP) — call it on the background
-/// executor. The result is cached per file, so repeat plays hit disk, not the
-/// network. `api_key` must be non-empty (the caller checks [`API_KEY`]).
+/// executor. The answer is kept in the file's own extended attribute, so repeat
+/// plays cost a `getxattr` rather than the network. `api_key` must be non-empty
+/// (the caller checks [`API_KEY`]).
 pub fn identify(track: &Track, api_key: &str) -> Option<Identification> {
-    // Key the cache on path + mtime, so a re-tagged file is retried rather than
-    // served a stale answer.
-    let cache_key = std::fs::metadata(&track.path)
-        .and_then(|m| m.modified())
+    // The same (mtime, size) identity the tags and the peaks use, so a re-tagged
+    // file is asked about again rather than served a stale answer. Not the path:
+    // the answer lives on the file now and follows it through a rename.
+    let stamp = std::fs::metadata(&track.path)
         .ok()
-        .map(|mtime| cache_key(&track.path, mtime));
+        .map(|metadata| meta_cache::stamp(&metadata));
 
-    if let Some(key) = &cache_key {
-        match read_cache(key) {
-            CacheResult::Hit(id) => return Some(id),
-            CacheResult::Miss => return None,
-            CacheResult::Absent => {}
+    if let Some(stamp) = stamp {
+        match id_cache::read(&track.path, stamp) {
+            Some(id_cache::Cached::Found(id)) => return Some(id),
+            Some(id_cache::Cached::Unknown) => return None,
+            None => {}
         }
     }
 
     let resolved = resolve(track, api_key);
 
-    if let Some(key) = &cache_key {
+    if let Some(stamp) = stamp {
         match &resolved {
-            Resolved::Found(id) => write_cache(key, id),
+            Resolved::Found(id) => id_cache::write_found(&track.path, stamp, id),
             // A definitive miss is remembered; a transient network error is not,
             // so the next play can try again.
-            Resolved::Miss => write_miss(key),
+            Resolved::Miss => id_cache::write_unknown(&track.path, stamp),
             Resolved::Transient => {}
         }
     }
@@ -424,87 +424,4 @@ fn pick_release_group(groups: &[serde_json::Value]) -> Option<&serde_json::Value
         .iter()
         .find(|g| g["type"].as_str() == Some("Album"))
         .or_else(|| groups.first())
-}
-
-// -- per-file resolution cache --------------------------------------------
-
-/// `$XDG_CACHE_HOME/hark/fingerprints`, sharing the base dir with the cover
-/// cache so both live under one `hark` folder.
-fn cache_dir() -> Option<PathBuf> {
-    artwork::cache_dir().and_then(|dir| dir.parent().map(|base| base.join("fingerprints")))
-}
-
-fn cache_key(path: &Path, mtime: SystemTime) -> String {
-    let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
-    mtime
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
-
-enum CacheResult {
-    Hit(Identification),
-    /// A `.miss` marker: AcoustID couldn't identify this file, don't ask again.
-    Miss,
-    Absent,
-}
-
-fn read_cache(key: &str) -> CacheResult {
-    let Some(dir) = cache_dir() else {
-        return CacheResult::Absent;
-    };
-    if let Ok(bytes) = std::fs::read(dir.join(key)) {
-        // A corrupt entry is treated as absent, so it can be recomputed.
-        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
-            && let Some(mbid) = value["mbid"].as_str()
-        {
-            let chapter_titles = value["chapter_titles"]
-                .as_array()
-                .map(|titles| titles.iter().map(|t| t.as_str().map(str::to_string)).collect())
-                .unwrap_or_default();
-            return CacheResult::Hit(Identification {
-                mbid: mbid.to_string(),
-                artist: value["artist"].as_str().map(str::to_string),
-                album: value["album"].as_str().map(str::to_string),
-                chapter_titles,
-            });
-        }
-        return CacheResult::Absent;
-    }
-    if dir.join(format!("{key}.miss")).exists() {
-        return CacheResult::Miss;
-    }
-    CacheResult::Absent
-}
-
-fn write_cache(key: &str, id: &Identification) {
-    let Some(dir) = cache_dir() else { return };
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
-    }
-    let value = serde_json::json!({
-        "mbid": id.mbid,
-        "artist": id.artist,
-        "album": id.album,
-        "chapter_titles": id.chapter_titles,
-    });
-    let Ok(bytes) = serde_json::to_vec(&value) else {
-        return;
-    };
-    // Write then rename, so a crash mid-write can't leave a truncated entry.
-    let tmp = dir.join(format!("{key}.tmp"));
-    if std::fs::write(&tmp, bytes).is_ok() {
-        let _ = std::fs::rename(&tmp, dir.join(key));
-    }
-}
-
-fn write_miss(key: &str) {
-    let Some(dir) = cache_dir() else { return };
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
-    }
-    let _ = std::fs::File::create(dir.join(format!("{key}.miss")));
 }

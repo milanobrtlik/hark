@@ -40,7 +40,11 @@ pub(crate) fn sniff(b: &[u8]) -> Option<ImageFormat> {
 /// `$XDG_CACHE_HOME/hark/covers`, else `~/.cache/hark/covers`. Mirrors the
 /// hand-rolled XDG resolution in `library::music_dir`. Not created here — the
 /// write path creates it lazily.
-pub fn cache_dir() -> Option<PathBuf> {
+///
+/// Covers are the one thing hark caches away from the files themselves. Image
+/// bytes are far past what an extended attribute will hold, and fetching one
+/// again costs a single request.
+fn cache_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from)
         && dir.is_absolute()
     {

@@ -6,6 +6,7 @@ mod library;
 mod meta_cache;
 mod mpris;
 mod opus_source;
+mod peak_cache;
 mod player_view;
 mod queue;
 mod theme;

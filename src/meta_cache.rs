@@ -44,10 +44,15 @@ const MAX_RECORD: usize = 16 * 1024;
 /// Not the path — the record travels with the file, so a rename inside the
 /// library keeps it. Not `ctime` either: writing the attribute moves `ctime`, so
 /// a record keyed on it would invalidate itself the moment it was written.
+///
+/// Three caches key on this now — the tag record here, the waveform peaks and
+/// the answer AcoustID gave — so the fields are open. Each writes them into a
+/// wire format of its own, which an accessor pair would serve no better; there
+/// is no invariant here to protect, only two numbers.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Stamp {
-    mtime_ns: i64,
-    size: u64,
+    pub mtime_ns: i64,
+    pub size: u64,
 }
 
 /// Nanoseconds rather than whole seconds because a batch re-tag rewrites a great

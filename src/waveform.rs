@@ -1,4 +1,4 @@
-use crate::decode;
+use crate::{decode, meta_cache, peak_cache};
 use anyhow::Result;
 use std::path::Path;
 
@@ -9,6 +9,34 @@ pub const PEAKS: usize = 220;
 /// Samples folded into one coarse peak during the first pass.
 const WINDOW: usize = 1024;
 
+/// The peaks for `path`: out of the file's own extended attribute when one is
+/// there and still matches it, decoded and written back when it is not. On a
+/// hit this costs a `stat` and a `getxattr`; on a miss it costs the whole file.
+///
+/// Blocking either way, so it belongs on the background executor where
+/// `PlayerView::load_waveform` puts it. The lookup is cheap but it is not free:
+/// on the mount this was written for, a `getxattr` is a round trip.
+///
+/// Shaped like `Track::load`, which does the same thing for the tags, so the
+/// two read alike: a failure comes back empty and is never cached.
+pub fn load(path: &Path) -> Vec<f32> {
+    let stamp = std::fs::metadata(path)
+        .ok()
+        .map(|metadata| meta_cache::stamp(&metadata));
+
+    if let Some(stamp) = stamp
+        && let Some(peaks) = peak_cache::read(path, stamp)
+    {
+        return peaks;
+    }
+
+    let peaks = compute(path).unwrap_or_default();
+    if let Some(stamp) = stamp {
+        peak_cache::write(path, stamp, &peaks);
+    }
+    peaks
+}
+
 /// Decodes the whole file and reduces it to `PEAKS` normalized amplitudes.
 ///
 /// RMS, not peak: modern masters are compressed hard enough that peak amplitude
@@ -16,8 +44,9 @@ const WINDOW: usize = 1024;
 /// RMS keeps the loudness contour visible.
 ///
 /// Meant to run on the background executor: a five-minute track is tens of
-/// millions of samples.
-pub fn compute(path: &Path) -> Result<Vec<f32>> {
+/// millions of samples. [`load`] is the way in — it only comes here when the
+/// file has no usable record.
+fn compute(path: &Path) -> Result<Vec<f32>> {
     let decoder = decode::open(path)?;
 
     let mut coarse: Vec<f32> = Vec::new();

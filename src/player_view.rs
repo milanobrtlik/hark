@@ -514,12 +514,18 @@ impl PlayerView {
         cx.notify();
     }
 
+    /// The lookup stays on the background executor with the decode, cheap as it
+    /// is: on a network mount reading an attribute is a round trip, and a wedged
+    /// mount must not be able to freeze the window on every track change.
     fn load_waveform(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         // Replacing the task cancels a decode still running for the old track.
+        // Its record is still written, which is deliberate: the record is keyed
+        // on the file rather than on whatever is playing, so skipping through a
+        // folder warms every track it passes.
         self._waveform_task = Some(cx.spawn(async move |this, cx| {
             let peaks = cx
                 .background_executor()
-                .spawn(async move { waveform::compute(&path).unwrap_or_default() })
+                .spawn(async move { waveform::load(&path) })
                 .await;
 
             this.update(cx, |this, cx| {

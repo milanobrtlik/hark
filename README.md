@@ -76,7 +76,16 @@ MP3, FLAC, WAV, AAC/M4A and Ogg Vorbis are handled by Symphonia (through rodio).
 container is demuxed by the `ogg` crate and the codec itself is decoded by libopus. It implements
 `rodio::Source`, including seeking via the granule positions of Ogg pages.
 
-## Metadata cache
+## What hark keeps on your files
+
+Everything hark works out about a file is written back onto that file, as an extended attribute.
+Not into the file — an attribute lives on the inode next to the permissions and the timestamps, so
+the audio is untouched, the modification time does not move and no other program sees it. Two
+things follow, and they are the whole reason for the design: a rename carries the record along, and
+a filesystem that replicates its own metadata carries it to another machine without hark doing
+anything.
+
+### The tags — `user.hark.meta`
 
 Reading a track's tags means opening and parsing the file, and a library scan does it once per
 file on every launch. That is free on a local disk and expensive on a network mount, where an open
@@ -94,17 +103,41 @@ hark: tracks queued: 1000 (964 cached) in 1.2s
 The record holds the tags, the duration, the chapters and a single bit saying the file has a
 cover — never the cover itself, which is read only when the track actually plays. It is stamped
 with the file's modification time and size, and that stamp is checked on every read, so re-tagging
-a file invalidates its record by itself. Keeping the record in the file rather than in an index
-somewhere else means a rename carries it along, and on a filesystem that replicates its own
-metadata it reaches another machine without hark doing anything.
+a file invalidates its record by itself.
+
+### The waveform — `user.hark.peaks`
+
+The bars under the cover art are 220 amplitudes measured across the track, and measuring them means
+decoding the whole file: tens of millions of samples for a five-minute song, and on a network mount
+the file comes across a second time to do it. Without a record that happens on every play of the
+same track, which makes it far and away the most expensive thing hark does.
+
+The record is 237 bytes — a version byte, the same stamp the tags carry, and one byte per bar. A
+byte is finer than 46-pixel-tall bars can show. A file that decodes to no audio at all is never
+remembered, on the same principle as a failed tag parse: it is more likely a half-copied file than a
+real answer, and freezing it in would leave a flat line that only `setfattr` could clear. Silence,
+which is a real answer, is remembered.
+
+Its version byte moves when the measurement changes, not only when the record's shape does. Unlike
+the tags, which mirror what is in the file, these mirror a calculation — so a changed calculation
+makes every stored record wrong about a file that has not moved, and the stamp cannot catch it.
+
+### Dropping a record
 
 Nothing here is load-bearing. A filesystem without extended attributes, a read-only mount or a
-record hark cannot make sense of all mean the same thing — parse the file, as before. The only
-symptom is that every run reports `(0 cached)`. To drop a record by hand:
+record hark cannot make sense of all mean the same thing — do the work again, as before. The only
+symptom is that every run reports `(0 cached)`. Note that ext4 fits *all* of an inode's attributes
+into a single 4 KiB block, which these records now share; on a heavily chaptered file the last one
+may simply not fit, and stays on the slow path.
 
 ```
-setfattr -x user.hark.meta track.flac
+setfattr -x user.hark.meta  track.flac   # the tags
+setfattr -x user.hark.peaks track.flac   # the waveform
 ```
+
+Album covers are the exception to all of this. Image bytes are far too big for an attribute, whose
+ceiling is 64 KiB, and fetching one again is a single HTTP request — so they stay in
+`~/.cache/hark/covers`.
 
 ## Audio
 

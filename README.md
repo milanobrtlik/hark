@@ -57,6 +57,9 @@ Tracks can also be added by dropping them onto the window or with the `+` button
 
 Space toggles play/pause.
 
+The heart in the footer loves the track that is playing, and the heart in the queue panel's header
+switches that list between the whole queue and the loved tracks.
+
 ## Where it left off
 
 Started with no arguments, hark comes back to the track it was on, seeked to where it stopped —
@@ -98,8 +101,8 @@ container is demuxed by the `ogg` crate and the codec itself is decoded by libop
 
 ## What hark keeps on your files
 
-Everything hark works out about a file is written back onto that file, as an extended attribute.
-Not into the file — an attribute lives on the inode next to the permissions and the timestamps, so
+Everything hark works out about a file — and the one thing you tell it — is written back onto that
+file, as an extended attribute. Not into the file — an attribute lives on the inode next to the permissions and the timestamps, so
 the audio is untouched, the modification time does not move and no other program sees it. Two
 things follow, and they are the whole reason for the design: a rename carries the record along, and
 a filesystem that replicates its own metadata carries it to another machine without hark doing
@@ -157,18 +160,41 @@ This replaces a cache under `~/.cache/hark/fingerprints`, which was keyed on the
 rename and never left the machine it was written on. **That folder is no longer used and can be
 deleted.**
 
+### The hearts — `user.hark.loved`
+
+The heart in the footer writes `user.hark.loved` onto the file that is playing, and pressing it
+again takes the attribute back off. That is the whole record: one byte, and its presence is the
+answer. The queue panel's header then switches between `Queue · 1024` and `Loved · 12` — and since
+the music folder is scanned into the queue at startup, that second list is the loved library.
+
+This one is different in kind from the three above, and it is worth being clear about why. Those
+are caches: throw one away and the next scan or the next play puts it back, and the only symptom is
+that hark is slower for a moment. Nothing can work out that you loved a track. So this record
+carries no stamp — re-tagging a file changes its tags, not your opinion of it, and a stamp here
+would quietly un-love a library the day you ran a tagger over it. And it is the one attribute whose
+failure hark tells you about, in red, at the bottom of the window: a read-only mount costs the
+others a recomputation and costs this one the thing itself.
+
+It travels the way the others do. Rename the file and the heart follows it; on a filesystem that
+replicates its own metadata it reaches your other machine without hark doing anything.
+
+Loving is per file, so a chaptered full-album rip is loved whole rather than a song at a time.
+
 ### Dropping a record
 
-Nothing here is load-bearing. A filesystem without extended attributes, a read-only mount or a
-record hark cannot make sense of all mean the same thing — do the work again, as before. The only
-symptom is that every run reports `(0 cached)`. Note that ext4 fits *all* of an inode's attributes
-into a single 4 KiB block, which these records now share; on a heavily chaptered file the last one
-may simply not fit, and stays on the slow path.
+Three of these are caches, and nothing about them is load-bearing. A filesystem without extended
+attributes, a read-only mount or a record hark cannot make sense of all mean the same thing — do the
+work again, as before. The only symptom is that every run reports `(0 cached)`. Note that ext4 fits
+*all* of an inode's attributes into a single 4 KiB block, which these records now share; on a
+heavily chaptered file the last one may simply not fit, and stays on the slow path.
+
+The hearts are the exception, and the only thing here that cannot be worked out again:
 
 ```
 setfattr -x user.hark.meta  track.flac   # the tags
 setfattr -x user.hark.peaks track.flac   # the waveform
 setfattr -x user.hark.id    track.flac   # what AcoustID said
+setfattr -x user.hark.loved track.flac   # the heart — nothing puts this back
 ```
 
 Album covers are the exception to all of this. Image bytes are far too big for an attribute, whose

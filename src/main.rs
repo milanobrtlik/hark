@@ -4,6 +4,7 @@ mod decode;
 mod fingerprint;
 mod id_cache;
 mod library;
+mod love;
 mod meta_cache;
 mod mpris;
 mod opus_source;

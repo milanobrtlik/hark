@@ -1,3 +1,4 @@
+use crate::love;
 use crate::meta_cache;
 use gpui::{Image, SharedString};
 use lofty::config::ParseOptions;
@@ -57,6 +58,10 @@ pub struct Track {
     pub chapters: Vec<Chapter>,
     /// The file has a cover of its own, to be decoded when it starts playing.
     pub has_art: bool,
+    /// The listener loves this one. Out of the file's own `user.hark.loved`
+    /// attribute, never out of [`Meta`] — that mirrors the tag record, and this
+    /// is the one thing hark keeps on a file that was never in it.
+    pub loved: bool,
 }
 
 pub const SUPPORTED: [&str; 8] = ["mp3", "flac", "ogg", "oga", "wav", "m4a", "aac", "opus"];
@@ -78,30 +83,45 @@ impl Track {
             .ok()
             .map(|metadata| meta_cache::stamp(&metadata));
 
+        // A second `getxattr`, unconditional, and deliberately outside the hit
+        // reported below: the tag record can be stale or missing while the file
+        // is still loved, and a file whose tags refuse to parse can be loved
+        // too. On the network mount all of this was written for that is one
+        // more round trip per file — the honest price of the queue knowing, for
+        // every track, whether it belongs in the loved list. There is no
+        // syscall that fetches two attributes at once, and a list that skipped
+        // some files would not be a list.
+        let loved = love::read(&path);
+
         if let Some(stamp) = stamp
             && let Some(meta) = meta_cache::read(&path, stamp)
         {
-            return (Track::from_meta(path, meta), true);
+            return (Track::from_meta(path, meta, loved), true);
         }
 
         let Some(meta) = parse(&path) else {
             // The file could not be read at all. That is a transient condition —
             // a half-copied file, a hiccup on the mount — and must not be frozen
             // into the file as a record saying it has nothing.
-            return (Track::from_meta(path, Meta::default()), false);
+            return (Track::from_meta(path, Meta::default(), loved), false);
         };
 
         if let Some(stamp) = stamp {
             meta_cache::write(&path, stamp, &meta);
         }
-        (Track::from_meta(path, meta), false)
+        (Track::from_meta(path, meta, loved), false)
     }
 
     /// The one way a `Track` is built, so a cache hit and a cold parse cannot
     /// drift apart. Falls back to the file name when the file carries no title —
     /// which is why the cached record leaves an absent tag out instead of
     /// storing a placeholder: a renamed file has to follow its new name.
-    pub fn from_meta(path: PathBuf, meta: Meta) -> Track {
+    ///
+    /// `loved` arrives beside `meta` rather than inside it because it comes off
+    /// a different part of the file: `meta` is exactly the tag record, and this
+    /// is a second attribute nothing in the audio can reproduce. Passed rather
+    /// than defaulted, so no later caller can build a `Track` without deciding.
+    pub fn from_meta(path: PathBuf, meta: Meta, loved: bool) -> Track {
         let stem = path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -116,6 +136,7 @@ impl Track {
             art: None,
             chapters: meta.chapters,
             has_art: meta.has_art,
+            loved,
             path,
         }
     }

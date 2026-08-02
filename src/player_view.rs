@@ -2,6 +2,7 @@ use crate::artwork;
 use crate::audio::Audio;
 use crate::fingerprint::{self, Identification};
 use crate::library;
+use crate::love;
 use crate::mpris::{self, Mpris};
 use crate::queue::{Queue, Repeat};
 use crate::state;
@@ -135,6 +136,11 @@ pub struct PlayerView {
     /// decoder stutter.
     scrub: Option<f32>,
     show_playlist: bool,
+    /// The queue panel is showing only the loved tracks. A lens on the panel
+    /// rather than a mode of the player, which is why it is not kept in the
+    /// session: coming back tomorrow to six rows of a thousand-track library,
+    /// with nothing on screen saying why, reads as a lost library.
+    show_loved: bool,
     /// Set once a fade-out-before-close is under way, so the close is only
     /// deferred once and the second attempt is let through.
     closing: bool,
@@ -235,6 +241,7 @@ impl PlayerView {
             peaks: Vec::new(),
             scrub: None,
             show_playlist: false,
+            show_loved: false,
             closing: false,
             seek_bounds: Rc::new(Cell::new(Bounds::default())),
             volume_bounds: Rc::new(Cell::new(Bounds::default())),
@@ -958,6 +965,39 @@ impl PlayerView {
         cx.notify();
     }
 
+    /// Loves the track that is loaded, or stops loving it, and writes that onto
+    /// the file. Nothing to do when nothing is loaded — the heart is dimmed in
+    /// that state, and the queue sitting there unplayed is how hark opens.
+    ///
+    /// On this thread and blocking, which is not how hark treats a mount
+    /// anywhere else. It is one `setxattr` on one file, asked for by a click,
+    /// and this same thread already opens a file and spins up a decoder every
+    /// time a track starts. Spawning it would buy back one repaint frame and
+    /// cost the only thing that matters here: nothing changes in memory unless
+    /// the write worked, so the heart never shows a state the file does not
+    /// have, and two quick presses cannot land out of order.
+    fn toggle_loved(&mut self, cx: &mut Context<Self>) {
+        let Some((index, track)) = self.queue.current.zip(self.queue.current_track()) else {
+            return;
+        };
+        let loved = !track.loved;
+        let path = track.path.clone();
+
+        match love::write(&path, loved) {
+            Ok(()) => {
+                self.queue.tracks[index].loved = loved;
+                self.error = None;
+            }
+            // The one attribute hark writes that somebody is watching.
+            // Everywhere else a read-only mount costs a recomputation and says
+            // nothing; here it costs the press, so it is said out loud.
+            Err(err) => {
+                self.error = Some(format!("could not write the heart onto the file: {err}").into());
+            }
+        }
+        cx.notify();
+    }
+
     /// Resumes or pauses the current track, easing the volume in or out so the
     /// change is never an abrupt cut. Play starts the audio straight away and
     /// ramps up; pause ramps down first and only then stops the player.
@@ -1456,6 +1496,8 @@ impl PlayerView {
             Repeat::One => "icons/repeat_one.svg",
             _ => "icons/repeat.svg",
         };
+        let loaded = self.queue.current.is_some();
+        let loved = self.queue.current_track().is_some_and(|track| track.loved);
 
         div()
             .flex()
@@ -1466,6 +1508,7 @@ impl PlayerView {
             .child(
                 div()
                     .flex()
+                    .flex_1()
                     .gap_2()
                     .child(toggle_button(
                         "playlist",
@@ -1491,9 +1534,34 @@ impl PlayerView {
                         }),
                     )),
             )
+            // Between the two groups rather than in either of them: those four
+            // are about the queue, this one is about the track. That lands it
+            // in the middle, under the play button, the way `controls()` puts
+            // the control that acts on what is playing in the centre.
+            .child(
+                toggle_button(
+                    "loved",
+                    if loved {
+                        "icons/heart_filled.svg"
+                    } else {
+                        "icons/heart.svg"
+                    },
+                    px(34.),
+                    px(15.),
+                    loved,
+                    cx.listener(|this, _, _, cx| this.toggle_loved(cx)),
+                )
+                // Nothing is loaded, so there is nothing to love. Dimmed rather
+                // than taken away: hark opens on a full queue with nothing
+                // playing, and a control that is missing exactly then hides the
+                // feature from anyone seeing the app for the first time.
+                .when(!loaded, |this| this.opacity(0.4).cursor_default()),
+            )
             .child(
                 div()
                     .flex()
+                    .flex_1()
+                    .justify_end()
                     .gap_2()
                     .child(toggle_button(
                         "repeat",
@@ -1518,16 +1586,28 @@ impl PlayerView {
 
     /// The queue, as a panel covering the player. Laid over it rather than
     /// squeezed in below the controls, which left it a row and a half tall in a
-    /// small window and sprawling in fullscreen.
+    /// small window and sprawling in fullscreen. The header switches it between
+    /// the whole queue and the loved tracks; since the music folder is scanned
+    /// into the queue at startup, that second list is the loved library.
     fn playlist(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let current = self.queue.current;
+        let loved_only = self.show_loved;
 
         let rows = self
             .queue
             .tracks
             .iter()
+            // Enumerated before the filter, never after: this index is the one
+            // `play_index` takes, and a row's place in a filtered list is not
+            // it.
             .enumerate()
-            .map(|(index, track)| {
+            .filter(|(_, track)| !loved_only || track.loved)
+            // And enumerated again for the number in the margin, which counts
+            // what is on screen. In the full queue the two agree; in the loved
+            // list, a track's place among a thousand others is not what anyone
+            // is looking at, and would not fit an 18-pixel column either.
+            .enumerate()
+            .map(|(row, (index, track))| {
                 let is_current = current == Some(index);
                 rounded(
                     div()
@@ -1553,7 +1633,7 @@ impl PlayerView {
                                 .child(if is_current {
                                     "▶".to_string()
                                 } else {
-                                    format!("{}", index + 1)
+                                    format!("{}", row + 1)
                                 }),
                         )
                         .child(
@@ -1591,7 +1671,7 @@ impl PlayerView {
             })
             .collect::<Vec<_>>();
 
-        let count = self.queue.tracks.len();
+        let count = rows.len();
 
         rounded(
             div()
@@ -1619,22 +1699,50 @@ impl PlayerView {
                     div()
                         .text_size(px(13.))
                         .text_color(theme::text_dim())
-                        .child(format!("Queue · {count}")),
+                        .child(if loved_only {
+                            format!("Loved · {count}")
+                        } else {
+                            format!("Queue · {count}")
+                        }),
                 )
-                .child(icon_button(
-                    "close-playlist",
-                    "icons/close.svg",
-                    px(26.),
-                    px(11.),
-                    cx.listener(|this, _, _, cx| {
-                        this.show_playlist = false;
-                        cx.notify();
-                    }),
-                )),
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(toggle_button(
+                            "loved-filter",
+                            if loved_only {
+                                "icons/heart_filled.svg"
+                            } else {
+                                "icons/heart.svg"
+                            },
+                            px(26.),
+                            px(11.),
+                            loved_only,
+                            cx.listener(|this, _, _, cx| {
+                                this.show_loved = !this.show_loved;
+                                cx.notify();
+                            }),
+                        ))
+                        .child(icon_button(
+                            "close-playlist",
+                            "icons/close.svg",
+                            px(26.),
+                            px(11.),
+                            cx.listener(|this, _, _, cx| {
+                                this.show_playlist = false;
+                                cx.notify();
+                            }),
+                        )),
+                ),
         )
         .child(
             div()
-                .id("playlist-scroll")
+                // One scroll offset per list. GPUI keeps it against the element
+                // id, and row five hundred of the queue is not where the loved
+                // list should open.
+                .id(("playlist-scroll", loved_only as usize))
                 .flex()
                 .flex_col()
                 .gap_0p5()
@@ -1644,6 +1752,25 @@ impl PlayerView {
                 .px_2()
                 .pb_2()
                 .overflow_y_scroll()
+                // Only reachable with the filter on: an empty queue never gets
+                // this far, since `body` shows the drop zone instead.
+                .when(rows.is_empty(), |this| {
+                    this.items_center()
+                        .justify_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .text_color(theme::text_dim())
+                                .child("Nothing loved yet"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(theme::text_faint())
+                                .child("Press the heart while a track is playing."),
+                        )
+                })
                 .children(rows),
         )
     }

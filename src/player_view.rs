@@ -1831,12 +1831,15 @@ impl PlayerView {
                     .items_center()
                     .justify_center()
                     .gap_4()
-                    // Scrolling anywhere over the player changes the volume. When
-                    // the playlist is open it covers this column and takes the
-                    // scroll for its own list instead.
-                    .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
-                        this.nudge_volume(&event.delta, cx)
-                    }))
+                    // Scrolling anywhere over the player changes the volume. The
+                    // open playlist covers this column, and scroll — unlike the
+                    // other mouse events — falls through whatever is on top of
+                    // it, so the handler has to step aside on its own.
+                    .when(!self.show_playlist, |this| {
+                        this.on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                            this.nudge_volume(&event.delta, cx)
+                        }))
+                    })
                     .child(self.cover())
                     .child(
                         div()

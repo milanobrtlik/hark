@@ -57,6 +57,11 @@ pub struct State {
     pub shuffle: bool,
     pub repeat: Repeat,
     pub playlist: bool,
+    /// The library roots the listener added, in the order they were added. The
+    /// XDG music folder is deliberately not among them: it is scanned and
+    /// watched on every start regardless, so keeping a copy here would only
+    /// produce a record that disagrees with the folder the desktop points at.
+    pub folders: Vec<PathBuf>,
     /// `None` when nothing was stored, or when what was stored was absurd.
     pub window: Option<Bounds<Pixels>>,
 }
@@ -70,6 +75,7 @@ impl Default for State {
             shuffle: false,
             repeat: Repeat::Off,
             playlist: false,
+            folders: Vec::new(),
             window: None,
         }
     }
@@ -144,6 +150,16 @@ fn encode(state: &State) -> Option<Vec<u8>> {
         object.insert("track".to_string(), track.into());
     }
 
+    // Same rule as `track`, and the key is written even when the list is empty:
+    // an explicit `[]` tells anyone reading the file that hark knows about
+    // folders and has none, which a missing key does not.
+    let folders: Vec<&str> = state
+        .folders
+        .iter()
+        .filter_map(|folder| folder.to_str())
+        .collect();
+    object.insert("folders".to_string(), folders.into());
+
     if let Some(window) = state.window {
         object.insert(
             "window".to_string(),
@@ -186,6 +202,20 @@ fn decode(bytes: &[u8]) -> Option<State> {
             _ => Repeat::Off,
         },
         playlist: record["playlist"].as_bool().unwrap_or(false),
+        // A record written before hark remembered folders has no key here and
+        // decodes to no folders, which is exactly what it meant. That is why
+        // the field costs no version bump — and a bump would have thrown away
+        // everyone's position to add a list they did not have yet.
+        folders: record["folders"]
+            .as_array()
+            .map(|folders| {
+                folders
+                    .iter()
+                    .filter_map(|folder| folder.as_str())
+                    .map(PathBuf::from)
+                    .collect()
+            })
+            .unwrap_or_default(),
         window: window(&record["window"]),
     })
 }
@@ -231,6 +261,10 @@ mod tests {
             shuffle: true,
             repeat: Repeat::One,
             playlist: true,
+            folders: vec![
+                PathBuf::from("/home/milan/hamstor/Music"),
+                PathBuf::from("/home/milan/Downloads/new"),
+            ],
             window: Some(Bounds {
                 origin: Point {
                     x: px(120.),
@@ -264,6 +298,13 @@ mod tests {
         assert!(state.shuffle);
         assert_eq!(state.repeat, Repeat::One);
         assert!(state.playlist);
+        assert_eq!(
+            state.folders,
+            vec![
+                PathBuf::from("/home/milan/hamstor/Music"),
+                PathBuf::from("/home/milan/Downloads/new"),
+            ]
+        );
 
         let window = state.window.expect("a usable window was dropped");
         assert_eq!(window.origin.x, px(120.));
@@ -278,7 +319,71 @@ mod tests {
         assert!(state.track.is_none());
         assert_eq!(state.position, Duration::ZERO);
         assert_eq!(state.volume, DEFAULT_VOLUME);
+        assert!(state.folders.is_empty());
         assert!(state.window.is_none());
+    }
+
+    /// The whole case for adding `folders` without bumping `VERSION`: a record
+    /// written before hark remembered folders still restores the session it does
+    /// describe, and simply has no folders in it.
+    #[test]
+    fn a_record_from_before_folders_were_remembered_still_loads() {
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "v": VERSION,
+            "volume": 0.3,
+            "track": "/music/x.flac",
+        }))
+        .expect("the fixture did not serialize");
+
+        let state = decode(&bytes).expect("an old record was refused outright");
+        assert!(state.folders.is_empty());
+        assert_eq!(state.volume, 0.3);
+        assert!(state.track.is_some());
+    }
+
+    #[test]
+    fn a_folder_that_is_not_a_path_is_dropped_without_losing_the_rest() {
+        for (folders, expected) in [
+            (
+                serde_json::json!(["/music/a", 7, null, "/music/b"]),
+                vec![PathBuf::from("/music/a"), PathBuf::from("/music/b")],
+            ),
+            (serde_json::json!("nonsense"), Vec::new()),
+            (serde_json::json!(42), Vec::new()),
+        ] {
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "v": VERSION,
+                "volume": 0.3,
+                "folders": folders,
+            }))
+            .expect("the fixture did not serialize");
+
+            let state = decode(&bytes).expect("a bad folder list voided the whole record");
+            assert_eq!(state.folders, expected);
+            assert_eq!(state.volume, 0.3);
+        }
+    }
+
+    /// The same trade the `track` field makes: base64 in a file meant to be read
+    /// by a person would cost more than the folder it saves.
+    #[test]
+    fn a_folder_whose_name_is_not_utf8_is_left_out() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let state = State {
+            folders: vec![
+                PathBuf::from("/music/a"),
+                PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0xff, 0xfe])),
+                PathBuf::from("/music/b"),
+            ],
+            ..State::default()
+        };
+
+        let decoded = round_trip(&state);
+        assert_eq!(
+            decoded.folders,
+            vec![PathBuf::from("/music/a"), PathBuf::from("/music/b")]
+        );
     }
 
     #[test]

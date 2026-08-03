@@ -8,7 +8,7 @@ use crate::queue::{Queue, Repeat};
 use crate::state;
 use crate::theme;
 use crate::track::{Chapter, Track, format_time};
-use crate::ui::{bar, fraction_at, icon_button, rounded, toggle_button};
+use crate::ui::{bar, fraction_at, icon_button, overlay, rounded, toggle_button};
 use crate::waveform;
 
 use notify::{RecursiveMode, Watcher};
@@ -23,7 +23,7 @@ use gpui::{
 };
 use std::cell::Cell;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -136,6 +136,17 @@ pub struct PlayerView {
     /// decoder stutter.
     scrub: Option<f32>,
     show_playlist: bool,
+    /// The folder panel. Not kept in the session, unlike `show_playlist`: it is
+    /// a place you go to change something and then leave, and opening hark
+    /// tomorrow into the folder list is not where anyone left off.
+    show_folders: bool,
+    /// The XDG music folder, scanned and watched on every start whether or not
+    /// it was ever asked for. Held apart from `folders` rather than merged into
+    /// it, because it is the one root the listener cannot take away — it comes
+    /// back from the desktop's configuration on the next start regardless.
+    music_dir: Option<PathBuf>,
+    /// The library roots the listener added, and what the state file keeps.
+    folders: Vec<Folder>,
     /// The queue panel is showing only the loved tracks. A lens on the panel
     /// rather than a mode of the player, which is why it is not kept in the
     /// session: coming back tomorrow to six rows of a thousand-track library,
@@ -176,6 +187,47 @@ pub struct PlayerView {
 struct Resume {
     path: PathBuf,
     position: Duration,
+}
+
+/// A remembered library root, and what the last scan made of it.
+struct Folder {
+    path: PathBuf,
+    /// The last scan of this root could be believed. Starts true and is
+    /// corrected by the first scan: showing a folder as reachable for the second
+    /// before anything has looked at it is a far smaller lie than greying out a
+    /// whole library because nothing has scanned yet.
+    available: bool,
+}
+
+/// What adding a folder means for the roots already there.
+enum Adopt {
+    /// A root already covers it. Its music is in the queue either way, and a
+    /// second root over the same tree would only be scanned and watched twice.
+    Covered,
+    /// It joins the roots, and any root it contains steps aside — keeping both
+    /// would leave a folder that cannot be removed without removing its parent.
+    Adopted { superseded: Vec<PathBuf> },
+}
+
+/// Decides `dir` against the roots already in use. `roots` includes the music
+/// folder, which is why choosing it again changes nothing; `removable` is only
+/// what the listener added, so the music folder is never superseded and adding
+/// its parent leaves both in place. The two then overlap, which costs a second
+/// walk and a few inotify watches over the shared tree — the price of never
+/// producing a root that cannot be taken away again.
+fn adopt(dir: &Path, roots: &[PathBuf], removable: &[PathBuf]) -> Adopt {
+    // `dir.starts_with(dir)` holds, so this is also the exact-duplicate case.
+    if roots.iter().any(|root| dir.starts_with(root)) {
+        return Adopt::Covered;
+    }
+
+    Adopt::Adopted {
+        superseded: removable
+            .iter()
+            .filter(|root| root.starts_with(dir))
+            .cloned()
+            .collect(),
+    }
 }
 
 /// A track stopped within this of its end resumes from the start instead. It had
@@ -241,6 +293,16 @@ impl PlayerView {
             peaks: Vec::new(),
             scrub: None,
             show_playlist: false,
+            show_folders: false,
+            music_dir: library::music_dir(),
+            folders: state
+                .folders
+                .iter()
+                .map(|path| Folder {
+                    path: path.clone(),
+                    available: true,
+                })
+                .collect(),
             show_loved: false,
             closing: false,
             seek_bounds: Rc::new(Cell::new(Bounds::default())),
@@ -274,43 +336,58 @@ impl PlayerView {
         view.queue.repeat = state.repeat;
         view.show_playlist = state.playlist;
 
-        // Files named on the command line play straight away; the music folder
-        // is only loaded into the queue.
+        // Files named on the command line play straight away, and go in through
+        // `add_paths` rather than `add_chosen`: naming a folder on the command
+        // line is one run of hark, not a change to the library.
         if !paths.is_empty() {
             view.add_paths(paths, true, cx);
         }
 
-        if let Some(dir) = library::music_dir() {
-            view.add_paths(vec![dir.clone()], false, cx);
-            view.watch(dir, cx);
+        view.start_watching(cx);
+        for root in view.roots() {
+            view.watch(&root);
         }
+        // One scan of every root rather than one `add_paths` per root: two roots
+        // that overlap would otherwise each load the shared files, and both
+        // batches pass a duplicate filter taken before either of them ran.
+        view.rescan(cx);
 
         view
     }
 
-    /// Keeps the queue in step with the music folder while the app runs.
-    fn watch(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+    /// Every root the queue is built from: the music folder first, then what the
+    /// listener added.
+    fn roots(&self) -> Vec<PathBuf> {
+        self.music_dir
+            .iter()
+            .chain(self.folders.iter().map(|folder| &folder.path))
+            .cloned()
+            .collect()
+    }
+
+    /// Creates the one watcher behind every root, and the loop that debounces
+    /// what it reports.
+    ///
+    /// One watcher for all of them: `notify` already keeps a watch per path, so
+    /// a second root is one more `watch` call. A watcher each would also mean a
+    /// debounce loop each, and two loops racing to rescan the same roots is one
+    /// copied file paying for two walks of the library.
+    fn start_watching(&mut self, cx: &mut Context<Self>) {
         let (tx, rx) = std::sync::mpsc::channel::<()>();
 
-        let mut watcher = match notify::recommended_watcher(move |event| {
+        match notify::recommended_watcher(move |event| {
             if let Ok(notify::Event { kind, .. }) = event
                 && is_library_change(&kind)
             {
                 let _ = tx.send(());
             }
         }) {
-            Ok(watcher) => watcher,
+            Ok(watcher) => self._watcher = Some(watcher),
             Err(err) => {
-                eprintln!("hark: cannot watch the folder: {err}");
+                eprintln!("hark: cannot watch for changes: {err}");
                 return;
             }
-        };
-
-        if let Err(err) = watcher.watch(&dir, RecursiveMode::Recursive) {
-            eprintln!("hark: cannot watch the folder: {err}");
-            return;
         }
-        self._watcher = Some(watcher);
 
         cx.spawn(async move |this, cx| {
             loop {
@@ -332,16 +409,7 @@ impl PlayerView {
                     .await;
                 while rx.try_recv().is_ok() {}
 
-                let dir = dir.clone();
-                let files = cx
-                    .background_executor()
-                    .spawn(async move { library::scan(&dir) })
-                    .await;
-
-                if this
-                    .update(cx, |this, cx| this.library_changed(files, cx))
-                    .is_err()
-                {
+                if this.update(cx, |this, cx| this.rescan(cx)).is_err() {
                     break;
                 }
             }
@@ -349,15 +417,87 @@ impl PlayerView {
         .detach();
     }
 
-    /// Merges a fresh scan of the music folder into the queue.
-    fn library_changed(&mut self, files: Vec<PathBuf>, cx: &mut Context<Self>) {
-        let existing: HashSet<PathBuf> = files.iter().cloned().collect();
-        self.queue.retain_existing(&existing);
+    /// Starts watching one root. A root that is not there — a mount that has not
+    /// come up — is simply not watched and says nothing about it; the rescan any
+    /// other root triggers picks its music up once it appears.
+    fn watch(&mut self, dir: &Path) {
+        let Some(watcher) = self._watcher.as_mut() else {
+            return;
+        };
+        if let Err(err) = watcher.watch(dir, RecursiveMode::Recursive)
+            && !matches!(err.kind, notify::ErrorKind::PathNotFound)
+        {
+            eprintln!("hark: cannot watch {}: {err}", dir.display());
+        }
+    }
 
-        let added: Vec<PathBuf> = files
-            .into_iter()
-            .filter(|path| !self.queue.contains(path))
+    /// Stops watching a root the listener removed. A root whose `watch` never
+    /// took is not worth a word: that is the unreachable folder, arriving
+    /// exactly as expected.
+    fn unwatch(&mut self, dir: &Path) {
+        if let Some(watcher) = self._watcher.as_mut() {
+            let _ = watcher.unwatch(dir);
+        }
+    }
+
+    /// Rescans every root and merges the result into the queue. Startup and the
+    /// watcher both come through here, so there is one way the queue is built
+    /// rather than two that can disagree.
+    fn rescan(&mut self, cx: &mut Context<Self>) {
+        let roots = self.roots();
+        if roots.is_empty() {
+            return;
+        }
+
+        cx.spawn(async move |this, cx| {
+            let scans = cx
+                .background_executor()
+                .spawn(async move { library::scan_roots(&roots) })
+                .await;
+
+            this.update(cx, |this, cx| this.library_changed(scans, cx)).ok();
+        })
+        .detach();
+    }
+
+    /// Merges a fresh scan of every root into the queue.
+    fn library_changed(&mut self, scans: Vec<library::Scan>, cx: &mut Context<Self>) {
+        for scan in &scans {
+            if let Some(folder) = self
+                .folders
+                .iter_mut()
+                .find(|folder| folder.path == scan.root)
+            {
+                folder.available = scan.complete;
+            }
+        }
+
+        // Only the roots whose scan could be believed get to prune, and they
+        // prune against everything those scans saw — a file that moved between
+        // two roots is still in the library.
+        let scanned: Vec<PathBuf> = scans
+            .iter()
+            .filter(|scan| scan.complete)
+            .map(|scan| scan.root.clone())
             .collect();
+        let found: HashSet<PathBuf> = scans
+            .iter()
+            .filter(|scan| scan.complete)
+            .flat_map(|scan| scan.files.iter().cloned())
+            .collect();
+        self.queue.retain_scanned(&scanned, &found);
+
+        // Files come from every scan, complete or not: a folder that is only
+        // half readable still has music in it worth queueing.
+        let known: HashSet<&PathBuf> = self.queue.tracks.iter().map(|track| &track.path).collect();
+        let mut added: Vec<PathBuf> = scans
+            .iter()
+            .flat_map(|scan| scan.files.iter())
+            .filter(|path| !known.contains(path))
+            .cloned()
+            .collect();
+        added.sort();
+        added.dedup();
 
         if added.is_empty() {
             cx.notify();
@@ -493,17 +633,41 @@ impl PlayerView {
     // -- queue -------------------------------------------------------------
 
     fn open_files(&mut self, cx: &mut Context<Self>) {
-        let paths = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: true,
-            multiple: true,
-            prompt: Some("Add".into()),
-        });
+        self.prompt_paths(
+            PathPromptOptions {
+                files: true,
+                directories: true,
+                multiple: true,
+                prompt: Some("Add".into()),
+            },
+            cx,
+        );
+    }
+
+    /// The folder panel's own way in. On Linux the two dialogs are the same
+    /// dialog: GPUI hands the request to the desktop portal keyed on
+    /// `directories` alone and never reads `files`, so the footer's `+` has
+    /// always been a folder chooser here. The options still say what is meant.
+    fn open_folder(&mut self, cx: &mut Context<Self>) {
+        self.prompt_paths(
+            PathPromptOptions {
+                files: false,
+                directories: true,
+                multiple: true,
+                prompt: Some("Add".into()),
+            },
+            cx,
+        );
+    }
+
+    /// Runs a path prompt and adds whatever comes back.
+    fn prompt_paths(&mut self, options: PathPromptOptions, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(options);
 
         cx.spawn(async move |this, cx| {
             match paths.await {
                 Ok(Ok(Some(paths))) => {
-                    this.update(cx, |this, cx| this.add_paths(paths, true, cx)).ok();
+                    this.update(cx, |this, cx| this.add_chosen(paths, cx)).ok();
                 }
                 Ok(Ok(None)) => {}
                 Ok(Err(err)) => eprintln!("hark: the file dialog failed: {err}"),
@@ -511,6 +675,100 @@ impl PlayerView {
             }
         })
         .detach();
+    }
+
+    /// Adds what the listener actually chose — the dialog, a drop on the window,
+    /// the folder panel — and remembers the folders among it, so they are back
+    /// tomorrow. Plain [`Self::add_paths`] stays the way in for everything hark
+    /// decides by itself: the rescan of roots it already knows, and the files
+    /// named on the command line, which are one run and not a library.
+    ///
+    /// Only folders are kept. A single file is a thing to hear now, and a state
+    /// file that slowly fills with every file ever dropped on the window would
+    /// be a library nobody assembled.
+    fn add_chosen(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        self.add_paths(paths.clone(), true, cx);
+
+        cx.spawn(async move |this, cx| {
+            // Off the main thread: `is_dir` and `canonicalize` are stats, and on
+            // the kind of mount this feature exists for a stat is a round trip.
+            let dirs = cx
+                .background_executor()
+                .spawn(async move {
+                    paths
+                        .into_iter()
+                        .filter(|path| path.is_dir())
+                        // Resolved once, here, while the folder is certainly
+                        // there — so `~/Music` and `/home/x/Music` cannot become
+                        // two roots. Never on load: a remembered path has to
+                        // survive its mount being down, and `canonicalize`
+                        // cannot.
+                        .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
+                        .collect::<Vec<_>>()
+                })
+                .await;
+
+            this.update(cx, |this, cx| this.remember(dirs, cx)).ok();
+        })
+        .detach();
+    }
+
+    /// Takes folders into the remembered list and starts watching them.
+    fn remember(&mut self, dirs: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let mut changed = false;
+
+        for dir in dirs {
+            let removable: Vec<PathBuf> =
+                self.folders.iter().map(|folder| folder.path.clone()).collect();
+            let Adopt::Adopted { superseded } = adopt(&dir, &self.roots(), &removable) else {
+                continue;
+            };
+
+            for old in superseded {
+                self.forget_quietly(&old);
+            }
+            self.watch(&dir);
+            self.folders.push(Folder {
+                path: dir,
+                available: true,
+            });
+            changed = true;
+        }
+
+        if changed {
+            self.save_now(cx);
+            cx.notify();
+        }
+    }
+
+    /// Takes a folder out of the library: it stops being watched, stops being
+    /// scanned, and its tracks leave the queue.
+    ///
+    /// The track that is playing stays, on the same trade `retain_scanned`
+    /// makes — removing a folder is a change to the library, not an instruction
+    /// to stop the music. It is then an orphan no scan will ever prune, which is
+    /// right: it belongs to no root now, exactly like a file dropped on the
+    /// window.
+    fn forget(&mut self, dir: &Path, cx: &mut Context<Self>) {
+        if !self.forget_quietly(dir) {
+            return;
+        }
+        self.save_now(cx);
+        cx.notify();
+    }
+
+    /// The removal itself, without the save. Split out for `remember`, which
+    /// supersedes a folder in the middle of adding its parent and writes once
+    /// at the end.
+    fn forget_quietly(&mut self, dir: &Path) -> bool {
+        let Some(index) = self.folders.iter().position(|folder| folder.path == dir) else {
+            return false;
+        };
+
+        self.folders.remove(index);
+        self.unwatch(dir);
+        self.queue.remove_under(dir);
+        true
     }
 
     /// Loads `paths` (files or folders) into the queue off the main thread.
@@ -549,6 +807,16 @@ impl PlayerView {
                 .await;
 
             this.update(cx, |this, cx| {
+                // The filter above saw the queue as it stood when this load
+                // began. Several roots load at once now, and a rescan can land
+                // between them, so the queue as it is has the last word.
+                let queued: HashSet<PathBuf> =
+                    this.queue.tracks.iter().map(|track| track.path.clone()).collect();
+                let tracks: Vec<Track> = tracks
+                    .into_iter()
+                    .filter(|track| !queued.contains(&track.path))
+                    .collect();
+
                 if tracks.is_empty() {
                     return;
                 }
@@ -674,6 +942,7 @@ impl PlayerView {
             shuffle: self.queue.shuffle,
             repeat: self.queue.repeat,
             playlist: self.show_playlist,
+            folders: self.folders.iter().map(|folder| folder.path.clone()).collect(),
             window: Some(self.window),
         }
     }
@@ -686,6 +955,13 @@ impl PlayerView {
         if self.saved_at.elapsed() < SAVE_EVERY {
             return;
         }
+        self.save_now(cx);
+    }
+
+    /// Writes the session out now, for a change the listener made on purpose and
+    /// would not forgive losing. A position moves on its own and is worth a few
+    /// seconds of risk; a folder they just added is not.
+    fn save_now(&mut self, cx: &mut Context<Self>) {
         self.saved_at = Instant::now();
 
         let snapshot = self.snapshot();
@@ -1574,6 +1850,20 @@ impl PlayerView {
                             cx.notify();
                         }),
                     ))
+                    // Next to the `+`, and not beside the playlist toggle: those
+                    // two are about the queue, these two are about the library
+                    // the queue is built from.
+                    .child(toggle_button(
+                        "folders",
+                        "icons/folder.svg",
+                        px(34.),
+                        px(15.),
+                        self.show_folders,
+                        cx.listener(|this, _, _, cx| {
+                            this.show_folders = !this.show_folders;
+                            cx.notify();
+                        }),
+                    ))
                     .child(icon_button(
                         "add",
                         "icons/add.svg",
@@ -1673,19 +1963,7 @@ impl PlayerView {
 
         let count = rows.len();
 
-        rounded(
-            div()
-                .absolute()
-                .top(px(0.))
-                .left(px(0.))
-                .size_full()
-                .flex()
-                .flex_col()
-                .bg(theme::panel())
-                .border_1()
-                .border_color(theme::border()),
-            CORNER,
-        )
+        overlay(CORNER)
         .child(
             div()
                 .flex()
@@ -1775,48 +2053,237 @@ impl PlayerView {
         )
     }
 
-    fn body(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.queue.is_empty() {
-            return div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .items_center()
-                .justify_center()
-                .gap_4()
-                .child(
-                    svg()
-                        .path("icons/note.svg")
-                        .size(px(48.))
-                        .text_color(theme::text_faint()),
-                )
-                .child(
+    /// The library roots, as a panel over the player. Everything hark scans is
+    /// on this list — including the desktop's music folder, which is scanned
+    /// whether it was asked for or not. It is shown without a way to remove it
+    /// rather than left out: a panel reporting no folders over a queue of a
+    /// thousand tracks reads as a lost library, and it is also what explains why
+    /// adding a folder inside it appears to do nothing.
+    fn folders_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let entries: Vec<(PathBuf, bool, bool)> = self
+            .music_dir
+            .iter()
+            .map(|dir| (dir.clone(), true, false))
+            .chain(
+                self.folders
+                    .iter()
+                    .map(|folder| (folder.path.clone(), folder.available, true)),
+            )
+            .collect();
+        let count = entries.len();
+
+        let rows = entries
+            .into_iter()
+            .enumerate()
+            .map(|(index, (path, available, removable))| {
+                let tracks = self
+                    .queue
+                    .tracks
+                    .iter()
+                    .filter(|track| track.path.starts_with(&path))
+                    .count();
+                let name = match path.file_name() {
+                    Some(name) => name.to_string_lossy().to_string(),
+                    None => path.display().to_string(),
+                };
+                let remove = path.clone();
+
+                rounded(
                     div()
-                        .text_size(px(14.))
-                        .text_color(theme::text_dim())
-                        .child("Drop music here"),
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap_2()
+                        .w_full()
+                        .h(px(46.))
+                        .px_2()
+                        // Unreachable right now — a mount that is not up, a
+                        // folder that will not open. Dimmed and left alone
+                        // rather than labelled: a scan cannot tell that apart
+                        // from a folder with no music in it, and its tracks are
+                        // still in the queue either way.
+                        .when(!available, |this| this.opacity(0.5))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .text_size(px(13.))
+                                        .text_color(theme::text())
+                                        .truncate()
+                                        .child(name),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(theme::text_dim())
+                                        .truncate()
+                                        .child(path.display().to_string()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(px(11.))
+                                .text_color(theme::text_faint())
+                                .child(format!("{tracks}")),
+                        )
+                        // The music folder has no cross: it comes back from the
+                        // desktop's configuration on the next start, so removing
+                        // it here would only be a promise hark cannot keep.
+                        .when(removable, |this| {
+                            this.child(icon_button(
+                                ("remove-folder", index),
+                                "icons/close.svg",
+                                px(26.),
+                                px(11.),
+                                cx.listener(move |this, _, _, cx| this.forget(&remove, cx)),
+                            ))
+                        }),
+                    px(8.),
                 )
-                .child(
+            })
+            .collect::<Vec<_>>();
+
+        overlay(CORNER)
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_between()
+                    .w_full()
+                    .px_3()
+                    .h(px(44.))
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(theme::text_dim())
+                            .child(format!("Folders · {count}")),
+                    )
+                    .child(icon_button(
+                        "close-folders",
+                        "icons/close.svg",
+                        px(26.),
+                        px(11.),
+                        cx.listener(|this, _, _, cx| {
+                            this.show_folders = false;
+                            cx.notify();
+                        }),
+                    )),
+            )
+            .child(
+                div()
+                    .id("folders-scroll")
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .w_full()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .px_2()
+                    .overflow_y_scroll()
+                    .when(rows.is_empty(), |this| {
+                        this.items_center()
+                            .justify_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .text_color(theme::text_dim())
+                                    .child("No folders yet"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(theme::text_faint())
+                                    .child("Add one below, or drop it on the window."),
+                            )
+                    })
+                    .children(rows),
+            )
+            .child(
+                div().flex().flex_none().w_full().p_2().child(
                     rounded(
                         div()
-                            .id("open")
-                            .px_4()
+                            .id("add-folder")
+                            .flex()
+                            .w_full()
+                            .justify_center()
                             .py_1p5()
                             .bg(theme::control())
                             .cursor_pointer()
                             .hover(|this| this.bg(theme::control_hover()))
                             .text_size(px(13.))
                             .text_color(theme::text())
-                            .child("Choose files")
-                            .on_click(cx.listener(|this, _, _, cx| this.open_files(cx))),
+                            .child("Add folder")
+                            .on_click(cx.listener(|this, _, _, cx| this.open_folder(cx))),
                         px(9.),
                     ),
+                ),
+            )
+    }
+
+    fn body(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.queue.is_empty() {
+            return div()
+                // The folder panel is positioned against this box too. The
+                // footer is hidden while the queue is empty, so without this the
+                // panel would vanish the moment removing the last folder emptied
+                // the queue, with no way back to it.
+                .relative()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h(px(0.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_h(px(0.))
+                        .items_center()
+                        .justify_center()
+                        .gap_4()
+                        .child(
+                            svg()
+                                .path("icons/note.svg")
+                                .size(px(48.))
+                                .text_color(theme::text_faint()),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(14.))
+                                .text_color(theme::text_dim())
+                                .child("Drop music here"),
+                        )
+                        .child(
+                            rounded(
+                                div()
+                                    .id("open")
+                                    .px_4()
+                                    .py_1p5()
+                                    .bg(theme::control())
+                                    .cursor_pointer()
+                                    .hover(|this| this.bg(theme::control_hover()))
+                                    .text_size(px(13.))
+                                    .text_color(theme::text())
+                                    .child("Choose files")
+                                    .on_click(cx.listener(|this, _, _, cx| this.open_files(cx))),
+                                px(9.),
+                            ),
+                        ),
                 )
+                .when(self.show_folders, |this| this.child(self.folders_panel(cx)))
                 .into_any_element();
         }
 
         div()
-            // The playlist is positioned against this box.
+            // The panels are positioned against this box.
             .relative()
             .flex()
             .flex_col()
@@ -1831,11 +2298,11 @@ impl PlayerView {
                     .items_center()
                     .justify_center()
                     .gap_4()
-                    // Scrolling anywhere over the player changes the volume. The
-                    // open playlist covers this column, and scroll — unlike the
+                    // Scrolling anywhere over the player changes the volume. An
+                    // open panel covers this column, and scroll — unlike the
                     // other mouse events — falls through whatever is on top of
                     // it, so the handler has to step aside on its own.
-                    .when(!self.show_playlist, |this| {
+                    .when(!self.show_playlist && !self.show_folders, |this| {
                         this.on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
                             this.nudge_volume(&event.delta, cx)
                         }))
@@ -1856,6 +2323,10 @@ impl PlayerView {
                     .child(self.volume(cx)),
             )
             .when(self.show_playlist, |this| this.child(self.playlist(cx)))
+            // After the playlist, so it covers it: the two are independent
+            // toggles, both reachable from the footer, and the one opened last
+            // is the one being read.
+            .when(self.show_folders, |this| this.child(self.folders_panel(cx)))
             .into_any_element()
     }
 }
@@ -1968,7 +2439,7 @@ impl Render for PlayerView {
                         .on_mouse_move(|_, _, cx| cx.stop_propagation())
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
-                            this.add_paths(paths.paths().to_vec(), true, cx);
+                            this.add_chosen(paths.paths().to_vec(), cx);
                         }))
                         .child(self.header(window, cx))
                         .child(
@@ -2051,3 +2522,48 @@ fn resize_edge(pos: Point<Pixels>, size: Size<Pixels>) -> Option<ResizeEdge> {
     Some(edge)
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn paths(paths: &[&str]) -> Vec<PathBuf> {
+        paths.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn a_folder_under_a_root_is_not_remembered_twice() {
+        let roots = paths(&["/music"]);
+
+        for dir in ["/music", "/music/rock/live"] {
+            assert!(matches!(
+                adopt(Path::new(dir), &roots, &roots),
+                Adopt::Covered
+            ));
+        }
+    }
+
+    #[test]
+    fn a_folder_that_contains_a_remembered_one_replaces_it() {
+        let roots = paths(&["/music/rock", "/music/folk", "/elsewhere"]);
+
+        let Adopt::Adopted { superseded } = adopt(Path::new("/music"), &roots, &roots) else {
+            panic!("a folder covering two roots was taken for one of them");
+        };
+        assert_eq!(superseded, paths(&["/music/rock", "/music/folk"]));
+    }
+
+    /// The music folder comes back from the desktop's configuration on every
+    /// start, so a root that swallowed it would leave hark scanning it twice
+    /// with only one of the two removable.
+    #[test]
+    fn the_music_folder_is_never_superseded() {
+        let roots = paths(&["/home/x/Music", "/home/x/more"]);
+        let removable = paths(&["/home/x/more"]);
+
+        let Adopt::Adopted { superseded } = adopt(Path::new("/home/x"), &roots, &removable) else {
+            panic!("a folder above the music folder was refused");
+        };
+        assert_eq!(superseded, paths(&["/home/x/more"]));
+    }
+}

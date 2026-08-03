@@ -53,7 +53,8 @@ hark                    # loads the music folder (XDG_MUSIC_DIR, else ~/Music)
 hark track.flac         # plays the given files or folders
 ```
 
-Tracks can also be added by dropping them onto the window or with the `+` button.
+Tracks can also be added by dropping them onto the window or with the `+` button. The folder button
+beside it opens the list of folders hark scans — see below.
 
 Space toggles play/pause.
 
@@ -79,6 +80,30 @@ rm ~/.local/state/hark/state.json
 Two things it does not restore. A track stopped within five seconds of its end starts from the
 beginning instead — it had effectively finished. And the window's *position* comes back only as a
 size: Wayland never tells a client where its window is, so the compositor places it.
+
+## Where the music is
+
+The folder button in the footer opens the list of everything hark scans, with the number of tracks
+each folder contributes. **Add folder** puts one on the list, the cross takes it off again — and the
+list is kept in the same `state.json`, so a folder added today is scanned tomorrow.
+
+Two things are on that list without being in the file. The desktop's music folder
+(`XDG_MUSIC_DIR`, else `~/Music`) is scanned and watched on every start whether it was asked for or
+not, so it is shown with no cross: it would come back on the next start anyway. And a folder inside
+one already on the list is not added twice — while a folder *containing* one takes its place, so a
+tree can never end up with a root that cannot be removed.
+
+Only folders are remembered. A single file dropped on the window, or named on the command line,
+plays for that session and is not taken to be a library.
+
+A folder that cannot be reached — an unmounted drive, a network share that is down — keeps its
+tracks in the queue and shows dimmed, rather than emptying the queue of a library that is merely
+offline. That is also why an empty folder is not taken as evidence that its music is gone: an
+unmounted mount point reads exactly like one. The cost is that a folder whose last track was deleted
+keeps its rows until something else in the library changes.
+
+Removing a folder takes its tracks out of the queue, except the one that is playing: removing a
+folder is a change to the library, not an instruction to stop the music.
 
 ## Media keys
 

@@ -14,6 +14,25 @@ pub fn rounded<T: Styled>(element: T, radius: Pixels) -> T {
         .rounded_br(radius)
 }
 
+/// A panel laid over the player: the queue and the folder list both come up
+/// this way. Filled and bordered, so whatever it covers does not read through
+/// it, and rounded to the window's own corner.
+pub fn overlay(radius: Pixels) -> Div {
+    rounded(
+        div()
+            .absolute()
+            .top(px(0.))
+            .left(px(0.))
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(theme::panel())
+            .border_1()
+            .border_color(theme::border()),
+        radius,
+    )
+}
+
 /// A circular icon button, as used for every control in the player.
 pub fn icon_button(
     id: impl Into<ElementId>,
